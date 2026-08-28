@@ -18,16 +18,23 @@ import (
 
 func wbModels() []pluginapi.ModelInfo {
 	return []pluginapi.ModelInfo{
-		{ID: "glm-5.2", Name: "GLM-5.2", ContextLength: 1000000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "glm-5.1", Name: "GLM-5.1", ContextLength: 131072, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "glm-5v-turbo", Name: "GLM-5V Turbo", ContextLength: 131072, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "kimi-k2.7", Name: "Kimi K2.7", ContextLength: 262144, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "minimax-m3", Name: "MiniMax M3", ContextLength: 204800, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "hy3", Name: "Hy3", ContextLength: 262144, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "hy3-preview", Name: "Hy3 Preview", ContextLength: 262144, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "hy3-preview-agent", Name: "Hy3 Preview Agent", ContextLength: 262144, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "deepseek-v4-pro", Name: "DeepSeek V4 Pro", ContextLength: 1000000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "deepseek-v4-flash", Name: "DeepSeek V4 Flash", ContextLength: 1000000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "glm-5.3", Name: "GLM-5.3", ContextLength: 1000000, MaxCompletionTokens: 48000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "glm-5.3-flash", Name: "GLM-5.3-Flash", ContextLength: 1000000, MaxCompletionTokens: 32000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "glm-5.2", Name: "GLM-5.2", ContextLength: 1000000, MaxCompletionTokens: 48000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "glm-5.1", Name: "GLM-5.1", ContextLength: 200000, MaxCompletionTokens: 48000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "glm-5v-turbo", Name: "GLM-5V Turbo", ContextLength: 200000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "kimi-k3-1", Name: "Kimi-K3", ContextLength: 1000000, MaxCompletionTokens: 32000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "kimi-k2.7", Name: "Kimi K2.7", ContextLength: 256000, MaxCompletionTokens: 32000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "kimi-k2.6", Name: "Kimi K2.6", ContextLength: 256000, MaxCompletionTokens: 32000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "minimax-m3", Name: "MiniMax M3", ContextLength: 512000, MaxCompletionTokens: 128000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "hy4-preview", Name: "Hy4 Preview", ContextLength: 1000000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "hy4-preview-x", Name: "Hy4 Preview X", ContextLength: 1000000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "hy3-x", Name: "Hy3 X", ContextLength: 192000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "hy3", Name: "Hy3", ContextLength: 192000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "hy3-preview", Name: "Hy3 Preview", ContextLength: 192000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "hy3-preview-agent", Name: "Hy3 Preview Agent", ContextLength: 192000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "deepseek-v4-pro", Name: "DeepSeek V4 Pro", ContextLength: 1000000, MaxCompletionTokens: 50000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "deepseek-v4-flash", Name: "DeepSeek V4 Flash", ContextLength: 1000000, MaxCompletionTokens: 50000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
 	}
 }
 
