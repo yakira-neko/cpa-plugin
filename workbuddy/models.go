@@ -14,10 +14,15 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	log "github.com/sirupsen/logrus"
 )
 
 func wbModels() []pluginapi.ModelInfo {
 	return []pluginapi.ModelInfo{
+		{ID: "hy4-preview", Name: "Hy4 Preview", ContextLength: 1000000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "hy3", Name: "Hy3", ContextLength: 192000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "hy3-x", Name: "Hy3 X", ContextLength: 192000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "deepseek-v4.1-flash", Name: "DeepSeek V4.1 Flash", ContextLength: 1000000, MaxCompletionTokens: 50000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
 		{ID: "glm-5.3", Name: "GLM-5.3", ContextLength: 1000000, MaxCompletionTokens: 48000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
 		{ID: "glm-5.3-flash", Name: "GLM-5.3-Flash", ContextLength: 1000000, MaxCompletionTokens: 32000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
 		{ID: "glm-5.2", Name: "GLM-5.2", ContextLength: 1000000, MaxCompletionTokens: 48000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
@@ -27,21 +32,21 @@ func wbModels() []pluginapi.ModelInfo {
 		{ID: "kimi-k2.7", Name: "Kimi K2.7", ContextLength: 256000, MaxCompletionTokens: 32000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
 		{ID: "kimi-k2.6", Name: "Kimi K2.6", ContextLength: 256000, MaxCompletionTokens: 32000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
 		{ID: "minimax-m3", Name: "MiniMax M3", ContextLength: 512000, MaxCompletionTokens: 128000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "hy4-preview", Name: "Hy4 Preview", ContextLength: 1000000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "hy4-preview-x", Name: "Hy4 Preview X", ContextLength: 1000000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "hy3-x", Name: "Hy3 X", ContextLength: 192000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "hy3", Name: "Hy3", ContextLength: 192000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "hy3-preview", Name: "Hy3 Preview", ContextLength: 192000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "hy3-preview-agent", Name: "Hy3 Preview Agent", ContextLength: 192000, MaxCompletionTokens: 64000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
 		{ID: "deepseek-v4-pro", Name: "DeepSeek V4 Pro", ContextLength: 1000000, MaxCompletionTokens: 50000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "deepseek-v4-flash", Name: "DeepSeek V4 Flash", ContextLength: 1000000, MaxCompletionTokens: 50000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
 	}
 }
 
 func cachedDynamicModels() ([]pluginapi.ModelInfo, bool) {
 	dynamicModelsCache.RLock()
 	defer dynamicModelsCache.RUnlock()
-	if len(dynamicModelsCache.models) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsCacheTTL {
+	if len(dynamicModelsCache.models) == 0 {
+		return nil, false
+	}
+	ttl := dynamicModelsCacheTTL
+	if dynamicModelsCache.fallback {
+		ttl = dynamicModelsFallbackTTL
+	}
+	if time.Since(dynamicModelsCache.fetched) < ttl {
 		return dynamicModelsCache.models, true
 	}
 	return nil, false
@@ -51,11 +56,29 @@ func storeDynamicModels(models []pluginapi.ModelInfo) {
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.models = models
 	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.fallback = false
+	dynamicModelsCache.Unlock()
+}
+
+// storeDynamicModelsFallback caches a static fallback list after a failed
+// dynamic fetch. Marked fallback so cachedDynamicModels expires it sooner,
+// giving the next query an early chance to retry the upstream.
+func storeDynamicModelsFallback(models []pluginapi.ModelInfo) {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.models = models
+	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.fallback = true
 	dynamicModelsCache.Unlock()
 }
 
 func fetchDynamicModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
 	if models, ok := cachedDynamicModels(); ok {
+		return models
+	}
+	fallback := func(reason string) []pluginapi.ModelInfo {
+		models := wbModels()
+		storeDynamicModelsFallback(models)
+		log.Warnf("workbuddy: dynamic model discovery unavailable (%s); serving static list (%d models)", reason, len(models))
 		return models
 	}
 	accessToken := ""
@@ -65,13 +88,17 @@ func fetchDynamicModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
 		}
 	}
 	if accessToken == "" {
-		return wbModels()
+		return fallback("no access token in auth storage")
 	}
-	if dyn, err := callModelsAPI(accessToken); err == nil && len(dyn) > 0 {
-		storeDynamicModels(dyn)
-		return dyn
+	dyn, err := callModelsAPI(accessToken)
+	if err != nil || len(dyn) == 0 {
+		if err == nil {
+			err = fmt.Errorf("empty model list")
+		}
+		return fallback(err.Error())
 	}
-	return wbModels()
+	storeDynamicModels(dyn)
+	return dyn
 }
 
 // fetchDynamicModels calls the WorkBuddy API to get the latest model list.

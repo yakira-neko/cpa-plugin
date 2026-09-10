@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.7
+
+### Model list sync with upstream + fallback observability
+
+- `models.go` — static `wbModels()` realigned to the upstream cli agent list
+  (verified against two live accounts): added `deepseek-v4.1-flash`; removed
+  `hy4-preview-x`, `hy3-preview`, `hy3-preview-agent`, `deepseek-v4-flash`
+  (no longer offered by upstream). List order now matches upstream.
+- `models.go` — dynamic-discovery fallback is no longer silent: when the
+  upstream models API can't be used (missing token, API error, no cli agent),
+  the plugin logs a warning with the reason and serves the static list.
+- `models.go` — fallback results are now cached with a shorter TTL (1 min vs
+  5 min for real data). Previously every `/v1/models` query retried a failing
+  upstream call, spamming the API and adding latency.
+- `creditlog.go` — `deepseek-v4.1-flash` added to the 0.5 credit factor tier.
+
+## Unreleased
+
+- Added request-level credit usage collection with JSONL persistence, retention limits, and model/hour/session aggregation APIs (/creditlog and /creditlog/summary).
+- Added panel-ready account credit package data and usage breakdown endpoints for per-request and session inspection.
+
 ## 0.8.2
 
 ### Concurrency + lifecycle hardening

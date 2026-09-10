@@ -369,10 +369,17 @@ func wbRegistration() registration {
 // upstream call per account.
 const dynamicModelsCacheTTL = 5 * time.Minute
 
+// dynamicModelsFallbackTTL bounds how long a STATIC fallback list is reused
+// after a failed dynamic fetch. Without it, every models query retries the
+// upstream call; with a persistently failing upstream that spams the API and
+// adds latency to every /v1/models request.
+const dynamicModelsFallbackTTL = 1 * time.Minute
+
 var dynamicModelsCache struct {
 	sync.RWMutex
-	models  []pluginapi.ModelInfo
-	fetched time.Time
+	models   []pluginapi.ModelInfo
+	fetched  time.Time
+	fallback bool // true when models holds a static fallback, not upstream data
 }
 
 //
