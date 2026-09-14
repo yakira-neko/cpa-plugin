@@ -20,6 +20,36 @@
 
 - Added request-level credit usage collection with JSONL persistence, retention limits, and model/hour/session aggregation APIs (/creditlog and /creditlog/summary).
 - Added panel-ready account credit package data and usage breakdown endpoints for per-request and session inspection.
+- Added prompt-cache token visibility: cache reads and cache writes are now parsed, stored and displayed as separate columns.
+  - `usage.go` — `usageDetailFromMap` now reads the OpenAI-nested counters
+    `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`
+    (previously only flat `cached_tokens` was read, so OpenAI-shaped upstreams
+    always reported zero cache hits). Also reads `cache_creation_input_tokens`
+    and `prompt_tokens_details.cache_creation_tokens`, and now accepts
+    `output_tokens_details.reasoning_tokens` alongside the existing
+    `completion_tokens_details` path.
+  - `creditlog.go` — new `creditEntry.CacheWrite` (`cache_creation_tokens`)
+    distinguishes cache writes from the existing `Cached` (`cached_tokens`)
+    read counter. Cache-creation tokens were previously dropped before storage
+    because `usageDetailLite` had no field for them.
+  - `creditlog.go` — `creditSnapshot()` exposes `cache_creation_tokens`; the
+    per-model aggregate (`creditModelTotal`) now carries both `cached_tokens`
+    and `cache_creation_tokens`; `creditGlobalSummary()` now reports token
+    counts at all (it previously exposed only request/credit counters).
+  - `panel.html` — the 消耗明细 view shows 缓存读取(命中) / 缓存写入 /
+    缓存命中率 / 输入 Token cards plus per-model and recent-request cache
+    read/write columns.
+  - Live-verified against `copilot.tencent.com/v2/chat/completions` (glm-5.3):
+    on a real prompt-cache hit the upstream returns
+    `prompt_tokens_details.cached_tokens=4043` while the **flat**
+    `cached_tokens` stays `0`. Flat-only parsing therefore reported zero cache
+    reads for a request that hit 4043 tokens — the bug this fixes. A captured
+    cache-hit response is pinned as a regression fixture in
+    `usage_detail_test.go` (`realCacheHitUsage`).
+  - Note: the upstream also exposes `prompt_cache_hit_tokens` /
+    `prompt_cache_write_tokens` / `prompt_cache_miss_tokens`, which are not
+    parsed. They carry the same read/write information as the keys above, so
+    nothing is lost; wiring them would be redundant.
 
 ## 0.8.2
 

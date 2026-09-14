@@ -148,6 +148,8 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/checkin", Description: "Manually check in one account (auth_index) or all."},
 			{Method: http.MethodPost, Path: base + "/checkin/config", Description: "Toggle auto check-in (enabled: true/false)."},
 			{Method: http.MethodGet, Path: base + "/credits", Description: "Get real-time credits for one (auth_index query) or all accounts."},
+			{Method: http.MethodGet, Path: base + "/creditlog", Description: "Request-level credit usage, model/hour/session aggregates."},
+			{Method: http.MethodGet, Path: base + "/creditlog/summary", Description: "Global credit usage summary."},
 			{Method: http.MethodPost, Path: base + "/import", Description: "Import WorkBuddy credential JSON (nested or flat) into host auth store."},
 			{Method: http.MethodPost, Path: base + "/trial", Description: "Claim expert trial pack for one Global account (auth_index). One-time 250 credits / 14 days."},
 			{Method: http.MethodPost, Path: base + "/select", Description: "Select the active account card used for chat routing (body: {auth_index})."},
@@ -201,6 +203,15 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCheckinConfig(req)))
 	case req.Method == http.MethodGet && path == base+"/credits":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCreditsQuery(req)))
+	case req.Method == http.MethodGet && path == base+"/creditlog":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCreditLogQuery(mgmtRequestLite{Raw: req.Body, Query: func(k string) string {
+			if v := req.Query[k]; len(v) > 0 {
+				return v[0]
+			}
+			return ""
+		}})))
+	case req.Method == http.MethodGet && path == base+"/creditlog/summary":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCreditLogSummary()))
 	case req.Method == http.MethodPost && path == base+"/import":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleImportAuth(req)))
 	case req.Method == http.MethodPost && path == base+"/trial":

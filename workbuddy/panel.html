@@ -184,7 +184,7 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
     <button class="sec" id="importBtn" onclick="openImportModal()">导入凭证</button>
     <button id="refreshBtn" onclick="load(true,this)">刷新数据</button>
     <button class="sec" onclick="checkinAll(this)">全部签到</button>
-    <button class="sec" onclick="claimTrialAll(this)" title="仅 Global · 一次性">全部领取</button>
+    <button class="sec" onclick="claimTrialAll(this)" title="仅 Global · 一次性">全部领取</button><button class="sec" onclick="showUsage()">消耗明细</button>
     <label class="toggle" title="仅 CN 账号 09:00 / 21:00"><input type="checkbox" id="autoToggle" onchange="toggleAuto(this.checked)"> 自动签到(CN)</label>
     <span class="toggle" id="svtime"></span>
   </div>
@@ -303,6 +303,13 @@ function markTrialDone(btn){
 }
 function fmtRemain(c){if(!c)return "-";const t=(c.total_remain||0)+(c.total_used||0);return c.total_remain+" 余 / "+t+" 总"}
 function esc(s){return (s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+// fmtTok renders a token count compactly (12345 -> "12.3k") so cache columns
+// stay readable; 0 renders as "0" (a real value, not missing).
+function fmtTok(n){n=Number(n)||0;if(n<0)return "0";if(n<999500){if(n<1000)return String(Math.round(n));return (n/1000).toFixed(1).replace(/\.0$/,"")+"k"}return (n/1000000).toFixed(2).replace(/\.?0+$/,"")+"M"}
+// Cache hit rate = cache reads / (prompt tokens + cache reads + cache writes).
+// Prompt tokens the upstream reports usually EXCLUDE cached ones, so the sum is
+// the true input volume; without that the ratio can exceed 100%.
+function cacheRate(read,write,input){const r=Number(read)||0,w=Number(write)||0,i=Number(input)||0;const base=i+r+w;return base>0?Math.round(r/base*100):0}
 function progressHTML(c){
   // total uses size when known; remain = spendable, used = cycle spend.
   // Check-in adds packs → size/remain go UP (grant). Chat spend → used goes UP, remain DOWN.
@@ -315,6 +322,7 @@ function progressHTML(c){
   const when=c.fetched_at?` · 快照 ${esc(String(c.fetched_at).replace('T',' ').replace('Z',' UTC'))}`:'';
   return `<div class="pb"><div class="pb-label"><span>可用 ${remain}</span><span>已用 ${used} · ${pct}%</span></div><div class="pb-track"><div class="pb-bar" style="width:${pct}%;background:${color}"></div></div><div class="pb-meta">剩余 ${remain} · 已用 ${used} · 额度池 ${total}${c.pack_count?` · ${c.pack_count} 个包`:''}${when}</div></div>`;
 }
+function packageHTML(c){const ps=(c&&c.packages)||[];if(!ps.length)return "";return `<details class="pkgs"><summary>积分包明细（${ps.length}）</summary>${ps.map(p=>`<div class="p"><span>${esc(p.name||p.type||"积分包")}</span><span>${Number(p.remain||p.remaining||0)} 余 / ${Number(p.size||p.total||0)} 总</span></div>`).join("")}</details>`}
 function bindCardActions(root){
   (root||document).querySelectorAll("[data-action]").forEach(btn=>{
     if(btn._bound) return;
@@ -362,6 +370,7 @@ function card(a){
   <h2>${esc(a.nickname||a.label||a.name)} <span style="display:flex;gap:6px;align-items:center">${badges}</span></h2>
   <div class="uid">${esc(a.uid||"")} · ${esc(a.name||"")}</div>
   ${progressHTML(cr)}
+  ${packageHTML(cr)}
   ${a.error?`<div class="row"><span class="k">错误</span><span class="v err">${esc(a.error)}</span></div>`:""}
   <div class="actions">${selectBtn}${refreshBtn}${actionHTML}</div>
   </div>`;
@@ -554,6 +563,39 @@ function renderSummary(accounts){
     <div class="pb-meta" style="margin-top:10px">全部账号池：可用 ${allRemain} · 已用 ${allUsed} · 池 ${allTotal||0}</div>
     `}
   `;
+}
+async function showUsage(){
+  try{
+    const d=await api("/creditlog?limit=80");
+    const box=document.getElementById("summaryBox");
+    const models=d.models||[], entries=d.entries||[];
+    // Totals come from the snapshot aggregate; fall back to summing entries so
+    // older backends (without the aggregate keys) still render numbers.
+    const sum=(arr,k)=>arr.reduce((a,x)=>a+(Number(x[k])||0),0);
+    const read=d.cached_tokens!==undefined?Number(d.cached_tokens)||0:sum(models,"cached_tokens");
+    const write=d.cache_creation_tokens!==undefined?Number(d.cache_creation_tokens)||0:sum(models,"cache_creation_tokens");
+    const input=sum(models,"input_tokens");
+    const rate=cacheRate(read,write,input);
+    const modelRows=models.map(x=>`<div class="p"><span>${esc(x.model)} · ${x.requests||0} 次</span><span>读 ${fmtTok(x.cached_tokens)} · 写 ${fmtTok(x.cache_creation_tokens)} · ${x.credits||0} 积分</span></div>`).join("")||"暂无";
+    const entryRows=entries.slice(0,20).map(x=>`<div class="p"><span>${new Date(x.at*1000).toLocaleString()} · ${esc(x.model)}</span><span>读 ${fmtTok(x.cached_tokens)} · 写 ${fmtTok(x.cache_creation_tokens)} · ${x.credits||0} 积分</span></div>`).join("")||"暂无记录";
+    box.style.display="block";
+    box.innerHTML=`
+      <div class="summary-hd">
+        <div class="summary-title">请求积分消耗</div>
+        <div class="summary-meta">估算值 · ${d.requests||0} 次 · ${d.credits||0} 积分</div>
+      </div>
+      <div class="summary-grid">
+        <div class="summary-item"><div class="k">缓存读取(命中)</div><div class="v ok">${fmtTok(read)}</div></div>
+        <div class="summary-item"><div class="k">缓存写入</div><div class="v">${fmtTok(write)}</div></div>
+        <div class="summary-item"><div class="k">缓存命中率</div><div class="v ${rate>0?"ok":""}">${input+read+write>0?rate+"%":"-"}</div></div>
+        <div class="summary-item"><div class="k">输入 Token</div><div class="v">${fmtTok(input)}</div></div>
+      </div>
+      <div class="row"><span class="k">按模型</span><span class="v">${models.map(x=>esc(x.model)+": "+x.credits).join(" · ")||"暂无"}</span></div>
+      <div class="row"><span class="k">按时段</span><span class="v">${(d.hours||[]).map(x=>x.hour+":00 "+x.credits).join(" · ")||"暂无"}</span></div>
+      <details class="pkgs" open><summary>按模型 Token 明细</summary>${modelRows}</details>
+      <details class="pkgs" open><summary>最近请求（缓存读/写）</summary>${entryRows}</details>`;
+    box.scrollIntoView({behavior:"smooth"});
+  }catch(e){toast("消耗明细加载失败","err",e.message||String(e))}
 }
 async function api(path, opts={}){
   const k=getKey();

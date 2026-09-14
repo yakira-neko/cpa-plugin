@@ -55,6 +55,7 @@ func handleUsage(raw []byte) ([]byte, error) {
 		record.Failure.StatusCode,
 		record.Failure.Body,
 	)
+	recordCreditUsage(record.AuthID, record.AuthID, record.Alias, record.Model, started, usageDetailLite{InputTokens: detail.InputTokens, OutputTokens: detail.OutputTokens, ReasoningTokens: detail.ReasoningTokens, CachedTokens: detail.CachedTokens, CacheReadTokens: detail.CacheReadTokens, CacheCreationTokens: detail.CacheCreationTokens, TotalTokens: detail.TotalTokens}, record.Failed, record.Failure.StatusCode, record.Failure.Body, record.Latency, "")
 	return okEnvelope(map[string]any{"forwarded": true})
 }
 
@@ -74,6 +75,7 @@ func publishUsage(requestedModel, upstreamModel, authID string, started time.Tim
 	if alias == "" {
 		alias = model
 	}
+	recordCreditUsage(authID, authID, alias, model, started, usageDetailLite{InputTokens: detail.InputTokens, OutputTokens: detail.OutputTokens, ReasoningTokens: detail.ReasoningTokens, CachedTokens: detail.CachedTokens, CacheReadTokens: detail.CacheReadTokens, CacheCreationTokens: detail.CacheCreationTokens, TotalTokens: detail.TotalTokens}, failed, statusCode, errBody, time.Since(started), "")
 	// Fire-and-forget so the executor hot path never blocks on the CPAMP
 	// round-trip. handleUsage (the host-driven path) is synchronous because the
 	// host already runs it on its own goroutine after the request completes.
@@ -195,17 +197,59 @@ func usageDetailFromMap(m map[string]any) usage.Detail {
 		}
 		return 0
 	}
+	// nested fetches a numeric field from a sub-object, e.g.
+	// nested("prompt_tokens_details", "cached_tokens"). Upstreams report cache
+	// counters either flat or nested depending on the API flavour, and the
+	// flat-only form silently reported zero for OpenAI-style responses.
+	nested := func(obj string, keys ...string) (int64, bool) {
+		sub, ok := m[obj].(map[string]any)
+		if !ok {
+			return 0, false
+		}
+		for _, k := range keys {
+			switch n := sub[k].(type) {
+			case float64:
+				return int64(n), true
+			case int64:
+				return n, true
+			case json.Number:
+				i, _ := n.Int64()
+				return i, true
+			}
+		}
+		return 0, false
+	}
 	d := usage.Detail{
 		InputTokens:     num("prompt_tokens", "input_tokens"),
 		OutputTokens:    num("completion_tokens", "output_tokens"),
 		TotalTokens:     num("total_tokens"),
 		CachedTokens:    num("cached_tokens"),
 		CacheReadTokens: num("cache_read_input_tokens"),
+		// Anthropic-flavoured cache-creation counter (flat).
+		CacheCreationTokens: num("cache_creation_input_tokens"),
 	}
-	if ct, ok := m["completion_tokens_details"].(map[string]any); ok {
-		if v, ok2 := ct["reasoning_tokens"].(float64); ok2 {
-			d.ReasoningTokens = int64(v)
-		}
+	// OpenAI-style nested counters: prefer these when the flat forms were
+	// absent, matching how the host parses its own upstream responses
+	// (helps/usage_helpers.go parseOpenAIStyleUsageNode).
+	if v, ok := nested("prompt_tokens_details", "cached_tokens"); ok && d.CachedTokens == 0 {
+		d.CachedTokens = v
+	}
+	if v, ok := nested("input_tokens_details", "cached_tokens"); ok && d.CachedTokens == 0 {
+		d.CachedTokens = v
+	}
+	if v, ok := nested("prompt_tokens_details", "cache_creation_tokens"); ok && d.CacheCreationTokens == 0 {
+		d.CacheCreationTokens = v
+	}
+	if v, ok := nested("completion_tokens_details", "reasoning_tokens"); ok {
+		d.ReasoningTokens = v
+	} else if v, ok := nested("output_tokens_details", "reasoning_tokens"); ok {
+		d.ReasoningTokens = v
+	}
+	// Cache reads are reported under different names per flavour; two of the
+	// three are the same counter. Keep CacheReadTokens populated so the
+	// panel's read/write split always has a value.
+	if d.CacheReadTokens == 0 {
+		d.CacheReadTokens = d.CachedTokens
 	}
 	return d
 }

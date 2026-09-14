@@ -7,3 +7,6 @@ dist/
 *.test
 *.out
 workbuddy/workbuddy-plus
+
+# local Go build cache (created when building the c-shared plugin)
+.gocache/
