@@ -10,8 +10,10 @@ dashboard.
 
 ## Features
 
-- **OAuth login** — multi-account `workbuddy-<uid>.json` auth files via the
-  host's auth store. CN and Global realms share one plugin, one config block.
+- **OAuth login** — sign in from the panel as either the CN or the Global
+  edition; multi-account `workbuddy-<uid>.json` auth files via the host auth
+  store. CN and Global share one plugin and one config, and each account is
+  classified by its `domain`.
 - **Dynamic models** — live model list from the upstream models API with a
   5-minute cache and a static fallback. Host-side `oauth-model-alias` /
   `oauth-excluded-models` config applies unchanged.
@@ -30,7 +32,7 @@ dashboard.
   trial pack from the panel.
 - **Dashboard** — embedded panel at `/v0/resource/plugins/workbuddy/panel`
   with credits progress bars, plan badges, exhausted/disabled flags, region
-  filter, and credential import.
+  filter, credential import, and CN/Global sign-in.
 - **Scheduler** (optional) — `scheduler_mode: credits` makes the plugin pick
   the panel-selected account; `off` (default) defers to CPA's built-in
   scheduler entirely.
@@ -71,9 +73,23 @@ plugins:
 ### 3. Sign in
 
 Open the WorkBuddy panel from CPA's sidebar (or hit
-`/v0/resource/plugins/workbuddy/panel` directly) and click **登录** to start
-the OAuth flow. Repeat for each account you want to add — the plugin writes
-one `workbuddy-<uid>.json` per account to the auth store.
+`/v0/resource/plugins/workbuddy/panel` directly) and click **登录账号**
+(Sign in):
+
+- Pick **国内版 CN** or **国际版 Global** in the dialog and start the flow.
+- The browser opens that edition's login page; sign in with the matching
+  account within 5 minutes.
+- The panel polls automatically, then writes `workbuddy-<uid>.json` and
+  refreshes the list.
+
+Both editions speak the identical OAuth protocol and the plugin classifies the
+account by its `domain`, so no extra configuration is needed. The
+**导入凭证** (Import credential) path still works for credentials you already
+have.
+
+> CPA's built-in "add auth" card has no region selector and always starts a
+> login on the gateway set by `default_region` (default `cn`). Use the panel's
+> **登录账号** button to sign in to the Global edition.
 
 ### 4. Use it
 
@@ -100,6 +116,11 @@ plugins:
   configs:
     workbuddy:
       enabled: true
+
+      # Which edition the CPA built-in auth card signs into (default "cn").
+      # The panel's sign-in button picks per click and ignores this.
+      # Accepts cn / global (also intl, international, overseas).
+      default_region: "cn"
 
       # Daily check-in automation for CN accounts (default true).
       # Runs at 09:00 and 21:00 local time.

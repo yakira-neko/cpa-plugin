@@ -87,24 +87,114 @@ const (
 	originReferer       = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 
-	// CN endpoint aliases (login / chat / models). upstreamBaseCN is the only
-	// CN base; Global has its own upstreamBaseGlobal. No "upstreamBase" legacy
-	// alias — removed in v0.6.31 dead-code sweep.
-	endpointAuthState    = upstreamBaseCN + "/v2/plugin/auth/state?platform=CLI"
-	endpointLoginAcct    = upstreamBaseCN + "/v2/plugin/login/account?state="
-	endpointAuthToken    = upstreamBaseCN + "/v2/plugin/auth/token?state="
+	// CN endpoint aliases (chat / models / refresh) that have no per-account
+	// region variance. Login endpoints are NOT here: they are built per region
+	// via Region.authStateURL/authTokenURL/loginAcctURL, because a Global login
+	// must hit workbuddy.ai. (endpointAuthState/endpointAuthToken/
+	// endpointLoginAcct removed in v0.9.0 after region routing landed.)
 	endpointTokenRefresh = upstreamBaseCN + "/v2/plugin/auth/token/refresh"
 	endpointChat         = upstreamBaseCN + "/v2/chat/completions"
 	endpointModels       = upstreamBaseCN + "/console/enterprises/personal/models"
 
+	// Region path suffixes. The Global login flow speaks the exact same OAuth
+	// protocol as CN — only the host differs (verified live 2026-09-14):
+	//   POST https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI
+	//     -> code:0, authUrl=https://www.workbuddy.ai/login?platform=CLI&state=...
+	// Both backends also accept each other's state on auth/token, but we route
+	// polls to the region that issued the state rather than rely on that.
+	authStatePath    = "/v2/plugin/auth/state?platform=CLI"
+	loginAcctPath    = "/v2/plugin/login/account?state="
+	authTokenPath    = "/v2/plugin/auth/token?state="
+	tokenRefreshPath = "/v2/plugin/auth/token/refresh"
+
 	loginTTL = 5 * time.Minute
 )
+
+// Region identifies which CodeBuddy gateway a login flow (and the account it
+// produces) belongs to.
+type Region string
+
+const (
+	RegionCN     Region = "cn"
+	RegionGlobal Region = "global"
+)
+
+// normalizeRegion maps arbitrary user/host input onto a known region, defaulting
+// to CN (the historical behaviour — every existing caller predates Global
+// login). Accepts the aliases the panel and CLI users naturally reach for.
+func normalizeRegion(s string) Region {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "global", "intl", "international", "workbuddy.ai", "www.workbuddy.ai", "us", "overseas":
+		return RegionGlobal
+	default:
+		return RegionCN
+	}
+}
+
+// regionBaseOverride redirects a region's gateway host during tests so the
+// login flow can be exercised against an httptest server. Empty = use the real
+// host. Guarded by a mutex because tests may run alongside the janitor.
+var (
+	regionBaseOverride   = map[Region]string{}
+	regionBaseOverrideMu sync.RWMutex
+)
+
+// setRegionBase overrides one region's base URL for tests; returns a restore func.
+func setRegionBase(region Region, base string) func() {
+	regionBaseOverrideMu.Lock()
+	old, had := regionBaseOverride[region]
+	regionBaseOverride[region] = base
+	regionBaseOverrideMu.Unlock()
+	return func() {
+		regionBaseOverrideMu.Lock()
+		defer regionBaseOverrideMu.Unlock()
+		if had {
+			regionBaseOverride[region] = old
+		} else {
+			delete(regionBaseOverride, region)
+		}
+	}
+}
+
+// baseURL is the gateway host for this region.
+func (r Region) baseURL() string {
+	regionBaseOverrideMu.RLock()
+	override, ok := regionBaseOverride[r]
+	regionBaseOverrideMu.RUnlock()
+	if ok && override != "" {
+		return strings.TrimRight(override, "/")
+	}
+	if r == RegionGlobal {
+		return upstreamBaseGlobal
+	}
+	return upstreamBaseCN
+}
+
+// authStateURL is the region's login-start endpoint.
+func (r Region) authStateURL() string { return r.baseURL() + authStatePath }
+
+// authTokenURL returns the poll endpoint for the given login state.
+func (r Region) authTokenURL(state string) string { return r.baseURL() + authTokenPath + state }
+
+// loginAcctURL returns the account-lookup endpoint for the given login state.
+func (r Region) loginAcctURL(state string) string { return r.baseURL() + loginAcctPath + state }
+
+// originRefererURL is the browser Origin/Referer pair for this region. Global
+// upstreams reject CN origins (and vice versa) on some endpoints.
+func (r Region) originRefererURL() string {
+	if r == RegionGlobal {
+		return originRefererGlobal
+	}
+	return originReferer
+}
 
 // loginCtx holds the cookie-affined HTTP client for one in-flight login flow.
 // CodeBuddy associates the browser login with the state issued at auth/state,
 // so we must reuse the same cookie jar across the state request and the polls.
+// region records which gateway issued the state so polling follows the login.
 type loginCtx struct {
 	client  *http.Client
+	region  Region
 	expires time.Time
 }
 
@@ -200,10 +290,25 @@ func cliproxyPluginShutdown() {
 // Host calls (async streaming + auth callbacks)
 // -----------------------------------------------------------------------------
 
+// hostCallHook, when non-nil, intercepts host RPCs. Test-only seam: the real
+// path needs a live host function-pointer table, which unit tests have no way
+// to construct (and the c-shared runtime cannot be initialised in-process).
+var hostCallHook func(method string, request []byte) ([]byte, error)
+
+// setHostCallHook installs a host RPC stub for tests; returns a restore func.
+func setHostCallHook(fn func(method string, request []byte) ([]byte, error)) func() {
+	old := hostCallHook
+	hostCallHook = fn
+	return func() { hostCallHook = old }
+}
+
 // hostCall invokes a host RPC method via the function-pointer table captured
 // at init. Used to push stream chunks back asynchronously (host.stream.emit /
 // host.stream.close) and to read the host's auth store (host.auth.list/get).
 func hostCall(method string, request []byte) ([]byte, error) {
+	if hostCallHook != nil {
+		return hostCallHook(method, request)
+	}
 	if hostAPI == nil || hostAPI.call == nil {
 		return nil, fmt.Errorf("host API unavailable")
 	}
@@ -500,12 +605,23 @@ func parseStored(raw []byte) (*storedAuth, error) {
 // HTTP plumbing
 // -------------------------------------------------------------------------------
 
+// commonHeaders applies the CN-flavoured header set. Prefer regionHeaders when
+// the request targets a known region; this wrapper exists for the many call
+// sites whose endpoint is CN-only (billing, check-in, trial).
 func commonHeaders(req *http.Request) {
+	regionHeaders(req, RegionCN)
+}
+
+// regionHeaders applies the common header set for a specific gateway. Global
+// upstreams validate Origin/Referer, so a Global request sent with the CN pair
+// is rejected exactly like a Global JWT sent to copilot.tencent.com.
+func regionHeaders(req *http.Request, region Region) {
+	origin := region.originRefererURL()
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", originReferer)
-	req.Header.Set("Referer", originReferer+"/")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", clientUA)
 }
 

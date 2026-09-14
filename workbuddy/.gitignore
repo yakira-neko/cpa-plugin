@@ -3,6 +3,7 @@
 *.h
 bin/
 dist/
+.gocache/
 
 # Test artifacts
 *.test

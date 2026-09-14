@@ -9,7 +9,7 @@ driven via the `pluginabi` RPC interface.
 | Capability | Implementation file | What it does |
 |---|---|---|
 | `ModelProvider` | `models.go` | Static + dynamic model list, alias reverse-resolution, `oauth-excluded-models` filter |
-| `AuthProvider` | `oauth.go`, `auth_parse.go` (in `authfile.go` / `main.go`) | OAuth login flow (CN + Global), token refresh, auth file parse |
+| `AuthProvider` | `oauth.go`, `auth_parse.go` (in `authfile.go` / `main.go`) | OAuth login flow (CN + Global, region-routed), token refresh, auth file parse |
 | `Executor` | `executor.go`, `stream.go`, `payload.go` | Chat completions, streaming SSE pump, request body rewriting |
 | `Scheduler` | `scheduler.go`, `active_auth.go` | Optional panel-selected account routing (`scheduler_mode: credits`) |
 | `ManagementAPI` | `management.go`, `panel.go`, `checkin.go`, `credits_handler.go`, `billing.go`, `usage_config.go`, `host_auth.go` | Dashboard, manual check-in, credits query, import credential, config |
@@ -33,7 +33,11 @@ payload.go        prepareUpstreamBody + InPlace mutators (forceStream/normalizeT
 models.go         callModelsAPI + fetchDynamicModels + cacheModelAliases +
                   resolveUpstreamModel + parseModelAliasAttribute + filterExcludedModels
 
-oauth.go          handleStartLogin/PollLogin/RefreshAuth + newLoginClient + doJSON
+oauth.go          startLoginFlow/handleStartLogin/PollLogin/RefreshAuth +
+                  newLoginClient + doJSON
+                  Region routing lives in main.go: Region type +
+                  normalizeRegion + baseURL/authStateURL/authTokenURL/
+                  loginAcctURL + regionHeaders + domainForRegion
 auth_parse.go     (in authfile.go / main.go) handleParseAuth + parseStored + toAuthData
 
 usage.go          handleUsage + publishUsage + forwardUsageToCPAMP + sseUsageCollector
@@ -42,7 +46,8 @@ management.go     managementRegistration + handleManagement + auth/ratelimit
 panel.go          buildDashboardEx + summarizeCredits + servePanel + panelHTML
 checkin.go        schedulerLoop + runAutoCheckin + handleManualCheckin + 
                   classifyCheckinTargets/executeCheckinBatch/summarizeCheckinResults
-credits_handler.go handleImportAuth/CheckinConfig/ClaimTrial/SelectAuth/CreditsQuery
+credits_handler.go handleImportAuth/CheckinConfig/ClaimTrial/SelectAuth/CreditsQuery +
+                   LoginStart/LoginPoll/LoginConfig (panel-driven CN/Global login)
 billing.go        fetchCheckinStatus/fetchUserResource/fetchPaymentType/
                   performCheckinCall/performTrialCall + JSON helpers
 usage_config.go   configure + resolveUsageReport + probe* + config vars
@@ -96,6 +101,31 @@ schedulerLoop → runAutoCheckin (sem=4 concurrent)
           → authfile.go applies: hostAuthPersist / deleteAuth
 ```
 
+### Login (CN / Global)
+
+Two entry points, one implementation:
+
+```
+panel.html "登录账号" (region chosen per click)
+  → POST /v0/management/plugins/workbuddy/login/start {region}
+      → handleLoginStart → startLoginFlow(region)
+          → POST <region base>/v2/plugin/auth/state?platform=CLI
+          → loginStates[state] = {client, region, expires}
+      ← {url, state, expires_at}
+  → browser completes login on that edition's page
+  → POST .../login/poll {state}   (panel loops every 2s)
+      → handleLoginPoll → handlePollLogin  (follows the stored region)
+          → GET <region base>/v2/plugin/auth/token?state=…   (pending until done)
+          → GET <region base>/v2/plugin/login/account?state=… (needs bearer)
+          → domainForRegion(tok.domain, region) → storedAuth
+      → host.auth.save "workbuddy-<uid>.json"
+      ← {status: success, region, uid, nickname, domain}
+
+CPA built-in "add auth" card (no region selector)
+  → auth.login.start → handleStartLogin → regionFromStartRequest
+      = request region hint ?? default_region config ?? cn
+```
+
 ### Dashboard load
 
 ```
@@ -145,6 +175,28 @@ panel.html → /v0/management/plugins/workbuddy/accounts
    `schedulerStop` channel and is idempotent. The plugin's `Shutdown` is a
    deliberate no-op because c-shared runtime teardown races with Go sync
    primitives (SIGSEGV) — `dlclose` cleans up the whole runtime anyway.
+
+8. **Region is a first-class concept, resolved at login time.** The panel picks
+   CN or Global per sign-in; a poll always targets the gateway that issued the
+   state; and the resulting credential's `domain` is what every later request
+   keys off (`upstreamBaseFor`, `billingBaseFor`, `originRefererFor`,
+   `accountRegion`). Three details matter:
+   - `regionHeaders` must be used for every region-scoped call. `doJSON` falls
+     back to CN headers, and the Global gateway rejects a `codebuddy.cn` Origin
+     exactly like it rejects a CN JWT.
+   - `domainForRegion` stamps a Global credential when upstream omits `domain`,
+     so an empty field can never silently produce a CN-classified Global
+     account (which would misroute chat/billing and change the exhaust policy
+     from *delete* to *disable*).
+   - The plugin does **not** rely on the two backends sharing login-state
+     storage (measured, but undocumented) — see decision 9.
+
+9. **The panel owns region choice, not the host card.** CPA's auth card calls
+   `auth.login.start` without a region selector and the SDK offers no
+   "hide/annotate card" hook (`AuthLoginStartRequest` carries only
+   Provider/BaseURL/Host/HTTPClient/Metadata). Rather than fork host behaviour,
+   the plugin exposes its own `/login/start` + `/login/poll` routes that the
+   panel drives, and honours `default_region` for the host card.
 
 ## Integration points with CPA
 

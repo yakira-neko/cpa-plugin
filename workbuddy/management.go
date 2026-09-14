@@ -149,6 +149,10 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/checkin/config", Description: "Toggle auto check-in (enabled: true/false)."},
 			{Method: http.MethodGet, Path: base + "/credits", Description: "Get real-time credits for one (auth_index query) or all accounts."},
 			{Method: http.MethodPost, Path: base + "/import", Description: "Import WorkBuddy credential JSON (nested or flat) into host auth store."},
+			{Method: http.MethodPost, Path: base + "/login/start", Description: "Start a CN or Global OAuth login (body: {region}); returns browser URL + state."},
+			{Method: http.MethodPost, Path: base + "/login/poll", Description: "Poll a panel-started login (body: {state}); persists the credential on success."},
+			{Method: http.MethodGet, Path: base + "/login/config", Description: "Get the default region used by host-driven login."},
+			{Method: http.MethodPost, Path: base + "/login/config", Description: "Set the default region for host-driven login (body: {default_region})."},
 			{Method: http.MethodPost, Path: base + "/trial", Description: "Claim expert trial pack for one Global account (auth_index). One-time 250 credits / 14 days."},
 			{Method: http.MethodPost, Path: base + "/select", Description: "Select the active account card used for chat routing (body: {auth_index})."},
 			{Method: http.MethodPost, Path: base + "/keepalive", Description: "Manually refresh access tokens for all accounts (or one with auth_index)."},
@@ -203,6 +207,14 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCreditsQuery(req)))
 	case req.Method == http.MethodPost && path == base+"/import":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleImportAuth(req)))
+	case req.Method == http.MethodPost && path == base+"/login/start":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleLoginStart(req)))
+	case req.Method == http.MethodPost && path == base+"/login/poll":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleLoginPoll(req)))
+	case req.Method == http.MethodGet && path == base+"/login/config":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleLoginConfig(req)))
+	case req.Method == http.MethodPost && path == base+"/login/config":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleLoginConfig(req)))
 	case req.Method == http.MethodPost && path == base+"/trial":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleClaimTrial(req)))
 	case req.Method == http.MethodPost && path == base+"/select":
@@ -330,6 +342,9 @@ func mutatingManagementPath(path string) bool {
 		base + "/checkin",
 		base + "/checkin/config",
 		base + "/import",
+		base + "/login/start",
+		base + "/login/poll",
+		base + "/login/config",
 		base + "/trial",
 		base + "/select",
 		base + "/keepalive":

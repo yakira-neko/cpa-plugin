@@ -42,7 +42,40 @@ var (
 	// plus per-IP token-bucket rate limiting on mutating endpoints.
 	managementAPIKey   = ""
 	managementAPIKeyMu sync.RWMutex
+
+	// defaultLoginRegion: which gateway host-driven logins (CPA's "add auth"
+	// card, which has no region selector) should target. The panel's own login
+	// button passes an explicit region per click and is unaffected by this.
+	// Empty (default) preserves historical behaviour → CN.
+	defaultLoginRegionValue   = ""
+	defaultLoginRegionValueMu sync.RWMutex
 )
+
+// defaultLoginRegion returns the configured default region for host-driven
+// login, falling back to CN when unset or unrecognised.
+func defaultLoginRegion() Region {
+	defaultLoginRegionValueMu.RLock()
+	v := defaultLoginRegionValue
+	defaultLoginRegionValueMu.RUnlock()
+	if strings.TrimSpace(v) == "" {
+		return RegionCN
+	}
+	return normalizeRegion(v)
+}
+
+// setDefaultLoginRegion sets the default region and returns a restore func
+// (test helper shape, matching setBillingBaseGlobal).
+func setDefaultLoginRegion(v string) func() {
+	defaultLoginRegionValueMu.Lock()
+	old := defaultLoginRegionValue
+	defaultLoginRegionValue = v
+	defaultLoginRegionValueMu.Unlock()
+	return func() {
+		defaultLoginRegionValueMu.Lock()
+		defaultLoginRegionValue = old
+		defaultLoginRegionValueMu.Unlock()
+	}
+}
 
 // Default URL tries localhost first (works for both bare-metal and Docker
 // host-network), falls back to Docker compose service name. The probe runs
@@ -62,6 +95,7 @@ func configure(raw []byte) {
 	nextSchedulerMode := schedulerModeOff // reset to default on reconfigure
 	nextKeepaliveAuto := true
 	nextMgmtKey := ""
+	nextDefaultRegion := ""
 
 	cfgURL, cfgKey := "", ""
 	if len(raw) > 0 {
@@ -104,6 +138,10 @@ func configure(raw []byte) {
 					v = strings.Trim(v, "\"'")
 					nextKeepaliveAuto = v == "true" || v == "1" || v == "yes" || v == "on"
 				}
+				if strings.HasPrefix(line, "default_region:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "default_region:"))
+					nextDefaultRegion = strings.Trim(v, "\"'")
+				}
 			}
 		}
 	}
@@ -133,6 +171,12 @@ func configure(raw []byte) {
 	managementAPIKeyMu.Lock()
 	managementAPIKey = nextMgmtKey
 	managementAPIKeyMu.Unlock()
+
+	// default_region: config_yaml > env WB_DEFAULT_REGION > CN.
+	if strings.TrimSpace(nextDefaultRegion) == "" {
+		nextDefaultRegion = strings.TrimSpace(os.Getenv("WB_DEFAULT_REGION"))
+	}
+	setDefaultLoginRegion(nextDefaultRegion)
 
 	resolveUsageReport(cfgURL, cfgKey)
 	ensureScheduler()

@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.9.0
+
+### Native Global (international) login
+
+Previously the plugin could only *run* Global accounts — there was no way to
+*create* one. CPA's own "add auth" card calls `auth.login.start` with no region
+selector, so it always opened the CN login page; the only workaround was to
+hand-edit the `state` in the browser URL. Global login is now a first-class,
+in-panel flow.
+
+- `oauth.go` — new `startLoginFlow(region)` is the single login entry point;
+  `handleStartLogin` (host card) and the new panel route both call it.
+  `handlePollLogin` now polls the gateway that **issued** the state instead of
+  always polling CN. (The two backends were measured to share state storage,
+  but relying on that undocumented coincidence would break silently if upstream
+  ever isolates them.)
+- `main.go` — new `Region` type (`cn` / `global`) with `normalizeRegion`
+  (accepts `global`, `intl`, `international`, `workbuddy.ai`, `overseas`, …),
+  per-region endpoint builders, and `regionHeaders`. The latter fixes a real
+  bug: `doJSON`'s fallback header set is CN, so Global `auth/state`,
+  `auth/token` and `login/account` calls were being sent with a
+  `codebuddy.cn` Origin — the same class of rejection as a Global JWT sent to
+  `copilot.tencent.com`.
+- `main.go` — new `domainForRegion`: when upstream omits `domain` on a Global
+  login, the credential is stamped `www.workbuddy.ai`. Every downstream region
+  decision (chat base, billing base, Origin/Referer, check-in skip, trial
+  eligibility, exhaust-delete policy) keys off that field, so an empty domain
+  would have silently produced a CN-classified Global account.
+- `credits_handler.go` — panel login endpoints:
+  - `POST /login/start` `{region}` → `{url, state, expires_at, ttl_seconds}`
+  - `POST /login/poll` `{state}` → persists via `host.auth.save`, returns
+    `{status, region, uid, nickname, domain}`; `status` is `pending` while
+    waiting and terminal (`success` / `expired` / `error`) otherwise
+  - `GET|POST /login/config` → read/set `default_region` (runtime-only, like
+    the check-in toggle: the host exposes no plugin-config write callback)
+- `panel.html` — a 登录账号 button opening a modal with a CN / Global picker,
+  which opens the browser login page and drives the poll loop with live
+  progress. The existing 导入凭证 path is unchanged.
+- New `default_region` config (also `WB_DEFAULT_REGION` env) — controls which
+  gateway **host-driven** logins (the CPA card) target. Default `cn`,
+  preserving historical behaviour.
+- **Tests** — `region_test.go` extended and `login_panel_test.go` added:
+  region normalisation, per-region endpoints/headers, domain fallback,
+  region-from-start-request precedence, poll-follows-login-region (asserting
+  the *other* gateway is never contacted), zero-region CN fallback, and an
+  end-to-end `/login/start`→`/login/poll` run against a fake Global gateway
+  asserting the persisted credential's domain, file name and billing base.
+- **Test seam** — `hostCallHook` in `main.go` lets tests stub host RPCs; the
+  real path needs a live host function-pointer table that unit tests cannot
+  construct.
+- **Dead code** — `endpointAuthState`, `endpointAuthToken` and
+  `endpointLoginAcct` removed: login endpoints are now built per region
+  (`Region.authStateURL` / `authTokenURL` / `loginAcctURL`) because a Global
+  login must hit `workbuddy.ai`. The chat/models/refresh CN aliases stay.
+- **Note** — the old workaround (start a CN login, then hand-edit the browser
+  URL from `copilot.tencent.com/login` to `www.workbuddy.ai/login` keeping the
+  same `state`) still works, but is no longer necessary.
+
 ## 0.8.7
 
 ### Model list sync with upstream + fallback observability
