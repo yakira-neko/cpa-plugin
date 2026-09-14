@@ -65,25 +65,65 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 	return env.Data, resp.StatusCode, nil
 }
 
-func handleStartLogin(raw []byte) ([]byte, error) {
+// regionFromStartRequest extracts the desired login region from the host's
+// auth.login.start payload. The CPA host does not surface a region selector on
+// its login card, so the plugin-level config default (default_region) is the
+// effective signal there; Metadata is honoured when a host does pass it
+// through. Absent any hint we keep the historical CN behaviour.
+func regionFromStartRequest(raw []byte) Region {
+	if len(raw) > 0 {
+		var req pluginapi.AuthLoginStartRequest
+		if err := json.Unmarshal(raw, &req); err == nil && req.Metadata != nil {
+			if v, ok := req.Metadata["region"].(string); ok && strings.TrimSpace(v) != "" {
+				return normalizeRegion(v)
+			}
+		}
+		var probe struct {
+			Region string `json:"region"`
+		}
+		if err := json.Unmarshal(raw, &probe); err == nil && strings.TrimSpace(probe.Region) != "" {
+			return normalizeRegion(probe.Region)
+		}
+	}
+	return defaultLoginRegion()
+}
+
+// startLoginFlow issues a login state on the given region's gateway, registers
+// it for polling, and returns the browser-facing login URL. Shared by the host
+// AuthProvider RPC (handleStartLogin) and the panel-driven management route
+// (/login/start), which is how a user picks Global at runtime.
+func startLoginFlow(region Region) (pluginapi.AuthLoginStartResponse, error) {
 	client := newLoginClient()
-	data, _, err := doJSON(client, http.MethodPost, endpointAuthState, nil, bytes.NewReader([]byte("{}")))
+	headers := func(r *http.Request) { regionHeaders(r, region) }
+	data, _, err := doJSON(client, http.MethodPost, region.authStateURL(), headers, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return nil, fmt.Errorf("auth state failed: %w", err)
+		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("%s auth state failed: %w", region, err)
 	}
 	var st authStateData
 	_ = json.Unmarshal(data, &st)
 	if st.State == "" || st.AuthURL == "" {
-		return nil, fmt.Errorf("auth state: missing state or authUrl — please restart the login flow")
+		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("auth state: missing state or authUrl — please restart the login flow")
 	}
-	loginStates.Store(st.State, &loginCtx{client: client, expires: time.Now().Add(loginTTL)})
-	return okEnvelope(pluginapi.AuthLoginStartResponse{
+	expires := time.Now().Add(loginTTL)
+	loginStates.Store(st.State, &loginCtx{client: client, region: region, expires: expires})
+	return pluginapi.AuthLoginStartResponse{
 		Provider:  providerName,
 		URL:       st.AuthURL,
 		State:     st.State,
-		ExpiresAt: time.Now().Add(loginTTL).UTC(),
-		Metadata:  map[string]any{"logo": pluginLogoURL},
-	})
+		ExpiresAt: expires.UTC(),
+		Metadata: map[string]any{
+			"logo":   pluginLogoURL,
+			"region": string(region),
+		},
+	}, nil
+}
+
+func handleStartLogin(raw []byte) ([]byte, error) {
+	resp, err := startLoginFlow(regionFromStartRequest(raw))
+	if err != nil {
+		return nil, err
+	}
+	return okEnvelope(resp)
 }
 
 func handlePollLogin(raw []byte) ([]byte, error) {
@@ -104,6 +144,13 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 		loginStates.Delete(state)
 		return nil, fmt.Errorf("poll: login expired (5 min timeout) — please re-initiate login and complete within 5 minutes")
 	}
+	// Poll the gateway that issued this state. Live testing showed both
+	// backends accept each other's state, but following the issuing region is
+	// the documented-protocol behaviour and survives upstream isolation.
+	region := lc.region
+	if region == "" {
+		region = RegionCN // pre-Global loginCtx (or zero value) → historical default
+	}
 
 	// Single-shot poll per RPC: the host drives the polling cadence.
 	// auth/token is the authoritative login-status endpoint: the application
@@ -111,7 +158,11 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	// with the token bundle once complete. login/account sits behind the
 	// openresty gateway and is rejected (401) until login finishes, so probe
 	// token first and only fetch account once we hold a bearer.
-	tokRaw, status, errTok := doJSON(lc.client, http.MethodGet, endpointAuthToken+state, nil, nil)
+	//
+	// Headers must follow the region: doJSON's fallback is CN, and the
+	// workbuddy.ai gateway rejects a CN Origin.
+	tokHeaders := func(r *http.Request) { regionHeaders(r, region) }
+	tokRaw, status, errTok := doJSON(lc.client, http.MethodGet, region.authTokenURL(state), tokHeaders, nil)
 	if errTok != nil {
 		// Transport-level failures and 5xx are real errors, not "still waiting":
 		// surface them so the user sees a failure instead of polling until TTL.
@@ -135,10 +186,10 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 
 	var acct accountData
 	acctHeaders := func(r *http.Request) {
-		commonHeaders(r)
+		regionHeaders(r, region)
 		r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	}
-	if acctRaw, _, errAcct := doJSON(lc.client, http.MethodGet, endpointLoginAcct+state, acctHeaders, nil); errAcct == nil {
+	if acctRaw, _, errAcct := doJSON(lc.client, http.MethodGet, region.loginAcctURL(state), acctHeaders, nil); errAcct == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	}
 
@@ -147,7 +198,7 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 			AccessToken:  tok.AccessToken,
 			RefreshToken: tok.RefreshToken,
 			ExpiresAt:    time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix(),
-			Domain:       tok.Domain,
+			Domain:       domainForRegion(tok.Domain, region),
 		},
 		Account: storedAccount{
 			UID:          acct.UID,
@@ -160,6 +211,23 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 		Status: pluginapi.AuthLoginStatusSuccess,
 		Auth:   toAuthData(sa),
 	})
+}
+
+// domainForRegion guarantees the stored domain reflects the gateway the user
+// actually logged into. Every downstream region decision (billing base, chat
+// base, Origin/Referer, check-in skip, trial eligibility, exhaust policy) keys
+// off storedTokens.Domain via isGlobalDomain, so a Global login must never
+// persist an empty or CN domain. Upstream normally returns the right value; we
+// only fill in when it is missing, and never override a conflicting one (that
+// would mask an upstream change we would rather see).
+func domainForRegion(upstreamDomain string, region Region) string {
+	if d := strings.TrimSpace(upstreamDomain); d != "" {
+		return d
+	}
+	if region == RegionGlobal {
+		return "www.workbuddy.ai"
+	}
+	return "www.codebuddy.cn"
 }
 
 func handleRefreshAuth(raw []byte) ([]byte, error) {

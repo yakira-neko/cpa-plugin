@@ -77,6 +77,148 @@ func handleImportAuth(req pluginapi.ManagementRequest) map[string]any {
 	}
 }
 
+// handleLoginStart begins an OAuth login flow for an explicitly chosen region
+// and returns the browser login URL plus the state to poll with.
+//
+// This exists because CPA's own "add auth" card calls auth.login.start without
+// a region selector, so a user has no way to reach the Global login page from
+// the host UI. The panel owns region choice at click time instead.
+//
+// body: {"region":"cn"|"global"}
+func handleLoginStart(req pluginapi.ManagementRequest) map[string]any {
+	var body struct {
+		Region string `json:"region"`
+	}
+	_ = json.Unmarshal(req.Body, &body)
+	region := RegionCN
+	if strings.TrimSpace(body.Region) != "" {
+		region = normalizeRegion(body.Region)
+	} else {
+		region = defaultLoginRegion()
+	}
+	resp, err := startLoginFlow(region)
+	if err != nil {
+		return map[string]any{"success": false, "error": err.Error(), "region": string(region)}
+	}
+	return map[string]any{
+		"success":     true,
+		"region":      string(region),
+		"url":         resp.URL,
+		"state":       resp.State,
+		"expires_at":  resp.ExpiresAt.Format(time.RFC3339),
+		"ttl_seconds": int(loginTTL.Seconds()),
+	}
+}
+
+// handleLoginPoll performs one poll of a panel-started login flow. On success it
+// persists the credential through host.auth.save (same path as credential
+// import) and returns the account identity so the panel can select it.
+//
+// body: {"state":"..."}
+func handleLoginPoll(req pluginapi.ManagementRequest) map[string]any {
+	var body struct {
+		State string `json:"state"`
+	}
+	_ = json.Unmarshal(req.Body, &body)
+	state := strings.TrimSpace(body.State)
+	if state == "" {
+		return map[string]any{"status": "error", "error": "state is required"}
+	}
+
+	// Reuse the AuthProvider poll implementation so the panel and the host
+	// share exactly one login code path (and one set of region rules).
+	pollReq, _ := json.Marshal(pluginapi.AuthLoginPollRequest{Provider: providerName, State: state})
+	rawResp, err := handlePollLogin(pollReq)
+	if err != nil {
+		// A lost/expired state is terminal for the panel's poll loop; anything
+		// else may be transient upstream trouble the user can retry.
+		msg := err.Error()
+		status := "error"
+		if strings.Contains(msg, "unknown state") || strings.Contains(msg, "expired") {
+			status = "expired"
+		}
+		return map[string]any{"status": status, "error": msg}
+	}
+	var env envelope
+	if err := json.Unmarshal(rawResp, &env); err != nil || !env.OK {
+		return map[string]any{"status": "error", "error": "poll: bad envelope"}
+	}
+	var poll pluginapi.AuthLoginPollResponse
+	if err := json.Unmarshal(env.Result, &poll); err != nil {
+		return map[string]any{"status": "error", "error": "poll: " + err.Error()}
+	}
+	if poll.Status != pluginapi.AuthLoginStatusSuccess {
+		return map[string]any{"status": string(poll.Status), "message": poll.Message}
+	}
+
+	sa, err := parseStored(poll.Auth.StorageJSON)
+	if err != nil {
+		return map[string]any{"status": "error", "error": "parse credential: " + err.Error()}
+	}
+
+	// Persist exactly like credential import: nested storage + top-level
+	// type/note/logo/disabled, named workbuddy-<uid>.json.
+	fileJSON, err := buildAuthFileJSON(sa, false, displayNote(sa, nil, false), nil)
+	if err != nil {
+		return map[string]any{"status": "error", "error": err.Error()}
+	}
+	auth := toAuthData(sa)
+	saveReq := pluginapi.HostAuthSaveRequest{Name: auth.FileName, JSON: fileJSON}
+	saveBody, _ := json.Marshal(saveReq)
+	rawSave, err := hostCall(pluginabi.MethodHostAuthSave, saveBody)
+	if err != nil {
+		return map[string]any{"status": "error", "error": "host.auth.save: " + err.Error()}
+	}
+	var saveEnv envelope
+	if err := json.Unmarshal(rawSave, &saveEnv); err != nil || !saveEnv.OK {
+		msg := "host.auth.save failed"
+		if saveEnv.Error != nil && saveEnv.Error.Message != "" {
+			msg = saveEnv.Error.Message
+		}
+		return map[string]any{"status": "error", "error": msg}
+	}
+	var saveResp pluginapi.HostAuthSaveResponse
+	_ = json.Unmarshal(saveEnv.Result, &saveResp)
+
+	// A Global login whose response omitted `domain` still lands on the right
+	// side of every downstream branch (see domainForRegion).
+	region := accountRegion(sa)
+	// Drop a legacy workbuddy.json left beside the canonical uid file, so the
+	// host does not end up with two auth records for one credential.
+	if saveResp.Name != "" && !strings.EqualFold(saveResp.Name, authFileName) {
+		if legacyPath := strings.TrimSpace(saveResp.Path); legacyPath != "" {
+			dir := filepath.Dir(legacyPath)
+			_ = deleteAuthFileInDir(filepath.Join(dir, authFileName), dir)
+		}
+	}
+	return map[string]any{
+		"status":   "success",
+		"region":   region,
+		"uid":      sa.Account.UID,
+		"nickname": sa.Account.Nickname,
+		"domain":   sa.Auth.Domain,
+		"name":     saveResp.Name,
+		"path":     saveResp.Path,
+	}
+}
+
+// handleLoginConfig reports the region host-driven logins will use, and lets
+// the panel set it. Runtime-only like checkin/config: the CPA host exposes no
+// plugin-config write callback, so config_yaml wins again on restart.
+func handleLoginConfig(req pluginapi.ManagementRequest) map[string]any {
+	var body struct {
+		DefaultRegion string `json:"default_region"`
+	}
+	_ = json.Unmarshal(req.Body, &body)
+	if v := strings.TrimSpace(body.DefaultRegion); v != "" {
+		setDefaultLoginRegion(v)
+	}
+	return map[string]any{
+		"default_region": string(defaultLoginRegion()),
+		"persistent":     false,
+	}
+}
+
 func handleCheckinConfig(req pluginapi.ManagementRequest) map[string]any {
 	var body struct {
 		Enabled *bool `json:"enabled"`

@@ -123,6 +123,21 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
 .modal-ft{display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid var(--border);background:var(--surface);border-radius:0 0 var(--radius-lg) var(--radius-lg)}
 .modal-ft button.sec{background:var(--btn-sec);color:var(--fg)}
 .modal-ft button.sec:hover{background:var(--btn-sec-hover)}
+/* Login modal: CN / Global region picker */
+.region-pick{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:4px 0 12px}
+.rp-opt{display:flex;flex-direction:column;gap:2px;padding:12px;border:1.5px solid var(--border);border-radius:10px;cursor:pointer;background:var(--input-bg);transition:border-color .15s,background .15s}
+.rp-opt:hover{border-color:var(--acc-ring)}
+.rp-opt.active{border-color:var(--acc);background:var(--acc-ring)}
+.rp-opt input{position:absolute;opacity:0;pointer-events:none}
+.rp-name{font-weight:600;font-size:13px}
+.rp-host{color:var(--mut);font-size:11px;font-family:ui-monospace,monospace}
+.login-progress{font-size:12px;line-height:1.6;color:var(--mut);min-height:18px;word-break:break-all}
+.login-progress .lp-step{display:flex;gap:6px;align-items:flex-start}
+.login-progress .lp-step.done{color:var(--ok)}
+.login-progress .lp-step.err{color:var(--err)}
+.login-progress a{color:var(--acc);word-break:break-all}
+.login-progress .lp-link{display:inline-block;margin-top:4px;padding:6px 10px;border:1px solid var(--acc);border-radius:8px;text-decoration:none;color:var(--acc);font-size:12px}
+.login-progress .lp-link:hover{background:var(--acc-ring)}
 </style>
 <script>
 /* Early theme sync (before body paint): mirror CPA parent data-theme when
@@ -181,6 +196,7 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
     </div>
   </div>
   <div class="bar">
+    <button id="loginBtn" onclick="openLoginModal()">登录账号</button>
     <button class="sec" id="importBtn" onclick="openImportModal()">导入凭证</button>
     <button id="refreshBtn" onclick="load(true,this)">刷新数据</button>
     <button class="sec" onclick="checkinAll(this)">全部签到</button>
@@ -210,6 +226,34 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
     <div class="modal-ft">
       <button type="button" class="sec" onclick="closeImportModal()">取消</button>
       <button type="button" onclick="importAuth(this)">导入并保存</button>
+    </div>
+  </div>
+</div>
+<div class="modal-mask" id="loginModal" onclick="onLoginMaskClick(event)">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle">
+    <div class="modal-hd">
+      <h2 id="loginModalTitle">登录 WorkBuddy 账号</h2>
+      <button type="button" class="modal-x" onclick="closeLoginModal()" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <p class="hint">选择要登录的版本。CN 与国际版使用同一套插件与配置，登录后按账号自动识别区域。</p>
+      <div class="region-pick" id="regionPick">
+        <label class="rp-opt active" data-region="cn">
+          <input type="radio" name="loginRegion" value="cn" checked>
+          <span class="rp-name">国内版 CN</span>
+          <span class="rp-host">copilot.tencent.com</span>
+        </label>
+        <label class="rp-opt" data-region="global">
+          <input type="radio" name="loginRegion" value="global">
+          <span class="rp-name">国际版 Global</span>
+          <span class="rp-host">www.workbuddy.ai</span>
+        </label>
+      </div>
+      <div id="loginProgress" class="login-progress"></div>
+    </div>
+    <div class="modal-ft">
+      <button type="button" class="sec" onclick="closeLoginModal()">关闭</button>
+      <button type="button" id="loginGoBtn" onclick="startLogin(this)">开始登录</button>
     </div>
   </div>
 </div>
@@ -895,6 +939,124 @@ function closeImportModal(){
 function onImportMaskClick(e){
   if(e.target===document.getElementById("importModal")) closeImportModal();
 }
+/* ---------- Login (CN / Global) ----------
+   The CPA host's own "add auth" card always starts a CN login (no region
+   selector in the host UI), so the panel drives its own flow: /login/start with
+   an explicit region, then /login/poll until the credential is persisted.
+   State lives server-side; the poll loop here is just the driver. */
+const LOGIN_POLL_MS = 2000;
+let loginPollTimer = null;
+let loginPollState = null;
+
+function openLoginModal(){
+  const m=document.getElementById("loginModal");
+  if(!m)return;
+  m.classList.add("show");
+  resetLoginProgress();
+}
+function closeLoginModal(){
+  const m=document.getElementById("loginModal");
+  if(m)m.classList.remove("show");
+  stopLoginPoll();
+}
+function onLoginMaskClick(e){
+  if(e.target===document.getElementById("loginModal")) closeLoginModal();
+}
+function selectedRegion(){
+  const el=document.querySelector('input[name="loginRegion"]:checked');
+  return el?el.value:"cn";
+}
+function resetLoginProgress(){
+  const p=document.getElementById("loginProgress");
+  if(p)p.innerHTML="";
+  const b=document.getElementById("loginGoBtn");
+  if(b){b.disabled=false;b.textContent="开始登录"}
+}
+function loginStep(html, kind){
+  const p=document.getElementById("loginProgress");
+  if(!p)return;
+  p.innerHTML=html;
+  p.className="login-progress"+(kind?" "+kind:"");
+}
+function stopLoginPoll(){
+  if(loginPollTimer){clearTimeout(loginPollTimer);loginPollTimer=null}
+  loginPollState=null;
+}
+
+async function startLogin(btn){
+  stopLoginPoll();
+  const region=selectedRegion();
+  const label=region==="global"?"国际版 Global":"国内版 CN";
+  busy(btn,true);
+  loginStep("正在向 <b>"+esc(label)+"</b> 申请登录链接…");
+  let d;
+  try{
+    d=await api("/login/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({region})});
+  }catch(e){
+    loginStep('<div class="lp-step err">✗ 请求失败：'+esc(e.message)+'</div>','');
+    busy(btn,false);
+    return;
+  }
+  if(!d.success||!d.url||!d.state){
+    loginStep('<div class="lp-step err">✗ '+(esc(d.error||"未能获取登录链接"))+'</div>','');
+    busy(btn,false);
+    return;
+  }
+  loginPollState=d.state;
+  loginStep(
+    '<div class="lp-step done">✓ 登录链接已生成（'+esc(label)+'）</div>'+
+    '<div class="lp-step">请在浏览器完成登录，'+Math.round((d.ttl_seconds||300)/60)+' 分钟内有效。</div>'+
+    '<a class="lp-link" href="'+esc(d.url)+'" target="_blank" rel="noopener">打开登录页面 ↗</a>'
+  );
+  try{window.open(d.url,"_blank","noopener")}catch(e){}
+  busy(btn,false);
+  scheduleLoginPoll(btn,0);
+}
+
+function scheduleLoginPoll(btn, delay){
+  loginPollTimer=setTimeout(()=>pollLogin(btn), delay==null?LOGIN_POLL_MS:delay);
+}
+
+async function pollLogin(btn){
+  const state=loginPollState;
+  if(!state)return;
+  let d;
+  try{
+    d=await api("/login/poll",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({state})});
+  }catch(e){
+    // Transient network/RPC hiccup: keep polling, the state TTL bounds it.
+    scheduleLoginPoll(btn);
+    return;
+  }
+  if(d.status==="success"){
+    stopLoginPoll();
+    const who=d.nickname||d.uid||"账号";
+    const tag=d.region==="global"?"Global":"CN";
+    loginStep(
+      '<div class="lp-step done">✓ 登录成功</div>'+
+      '<div class="lp-step">'+esc(who)+' · '+tag+' · '+esc(d.domain||"")+'</div>'
+    );
+    toast("登录成功","ok",who+"（"+tag+"）→ "+(d.name||""));
+    await load(true);
+    return;
+  }
+  if(d.status==="expired"||d.status==="error"){
+    stopLoginPoll();
+    loginStep('<div class="lp-step err">✗ '+esc(d.error||"登录失败")+'</div>');
+    toast("登录失败","err",d.error||"");
+    return;
+  }
+  scheduleLoginPoll(btn);
+}
+
+document.querySelectorAll(".rp-opt").forEach(el=>{
+  el.addEventListener("click",()=>{
+    document.querySelectorAll(".rp-opt").forEach(o=>o.classList.remove("active"));
+    el.classList.add("active");
+    const r=el.querySelector("input");
+    if(r)r.checked=true;
+  });
+});
 async function importAuth(btn){
   const raw=(document.getElementById("importRaw").value||"").trim();
   if(!raw){toast("请粘贴凭证 JSON","warn");return}
@@ -915,6 +1077,7 @@ async function importAuth(btn){
 document.getElementById("keyInput").addEventListener("keydown",e=>{if(e.key==="Enter")saveKey()});
 document.addEventListener("keydown",e=>{
   if(e.key=="Escape"&&document.getElementById("importModal").classList.contains("show")) closeImportModal();
+  if(e.key=="Escape"&&document.getElementById("loginModal").classList.contains("show")) closeLoginModal();
 });
 /* Start theme sync watcher (parent MutationObserver + standalone prefers-color-scheme listener). */
 if(window.__wbThemeSync)window.__wbThemeSync();

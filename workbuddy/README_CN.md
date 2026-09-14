@@ -8,8 +8,9 @@
 
 ## 功能
 
-- **OAuth 登录** — 通过宿主 auth store 管理多账号 `workbuddy-<uid>.json`，
-  CN 和 Global 共用一个插件、一份配置。
+- **OAuth 登录** — 面板内可选 **国内版 CN / 国际版 Global** 登录；通过宿主
+  auth store 管理多账号 `workbuddy-<uid>.json`，CN 和 Global 共用一个插件、
+  一份配置，登录后按账号 `domain` 自动识别区域。
 - **动态模型** — 上游 models API 实时拉取 + 5 分钟缓存 + 静态 fallback。
   宿主侧 `oauth-model-alias` / `oauth-excluded-models` 配置直接生效。
 - **执行器** — OpenAI 兼容 chat completions，流式（真 SSE，走 `host.stream.emit`）
@@ -22,7 +23,7 @@
   全部签到。Per-account 互斥锁防止多浏览器标签并发重复签到。
 - **Trial 领取** — Global 账号可在面板领取一次性 250 积分专家加油包。
 - **积分面板** — 内嵌面板 `/v0/resource/plugins/workbuddy/panel`，含积分
-  进度条、套餐徽章、耗尽/禁用标记、CN/Global 筛选、凭证导入。
+  进度条、套餐徽章、耗尽/禁用标记、CN/Global 筛选、凭证导入、CN/Global 登录。
 - **调度器**（可选） — `scheduler_mode: credits` 让插件选中面板选中的账号；
   `off`（默认）完全交给 CPA 内置调度。
 - **Usage 上报** — 实现 `UsagePlugin` 能力，每条请求的 usage record 转发到
@@ -61,8 +62,17 @@ plugins:
 ### 3. 登录
 
 从 CPA 侧边栏打开 WorkBuddy 面板（或直接访问
-`/v0/resource/plugins/workbuddy/panel`），点 **登录** 走 OAuth 流程。
-每个账号登录一次，插件会把 `workbuddy-<uid>.json` 写入 auth store。
+`/v0/resource/plugins/workbuddy/panel`），点 **登录账号**：
+
+- 弹窗里选 **国内版 CN** 或 **国际版 Global**，点开始登录。
+- 浏览器会打开对应版本的登录页；用该版本的账号完成登录即可（5 分钟内）。
+- 面板会自动轮询，成功后写入 `workbuddy-<uid>.json` 并刷新列表。
+
+两端协议完全相同，插件按账号的 `domain` 自动识别区域，无需其他配置。
+也可以继续用 **导入凭证** 粘贴已有 JSON。
+
+> CPA 自带的新增认证卡片没有区域选项，它始终按 `default_region` 配置
+> （默认 `cn`）发起登录。要登录国际版请用面板的 **登录账号** 按钮。
 
 ### 4. 调用
 
@@ -88,6 +98,11 @@ plugins:
   configs:
     workbuddy:
       enabled: true
+
+      # CPA 自带认证卡片发起登录时使用的版本（默认 "cn"）。
+      # 面板的「登录账号」按钮每次点选，不受此项影响。
+      # 可选 cn / global（也接受 intl、international、overseas）。
+      default_region: "cn"
 
       # CN 账号每日自动签到（默认 true），09:00 和 21:00 本地时间。
       checkin_auto: true
