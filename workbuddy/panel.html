@@ -350,10 +350,13 @@ function esc(s){return (s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">
 // fmtTok renders a token count compactly (12345 -> "12.3k") so cache columns
 // stay readable; 0 renders as "0" (a real value, not missing).
 function fmtTok(n){n=Number(n)||0;if(n<0)return "0";if(n<999500){if(n<1000)return String(Math.round(n));return (n/1000).toFixed(1).replace(/\.0$/,"")+"k"}return (n/1000000).toFixed(2).replace(/\.?0+$/,"")+"M"}
-// Cache hit rate = cache reads / (prompt tokens + cache reads + cache writes).
-// Prompt tokens the upstream reports usually EXCLUDE cached ones, so the sum is
-// the true input volume; without that the ratio can exceed 100%.
-function cacheRate(read,write,input){const r=Number(read)||0,w=Number(write)||0,i=Number(input)||0;const base=i+r+w;return base>0?Math.round(r/base*100):0}
+// Cache hit rate = cache reads (hits) / input tokens, rendered with one decimal.
+// The upstream reports input/prompt tokens INCLUSIVE of the cached ones (the
+// pinned live fixture in usage_detail_test.go: prompt_tokens=4443 with 4043
+// cached + 400 miss), so cache reads are a subset of the denominator. Cache
+// WRITES must not enter it -- adding them inflated the base and made the ratio
+// read low on every cache-writing request.
+function cacheRate(read,input){const r=Number(read)||0,i=Number(input)||0;return i>0?r/i*100:0}
 function progressHTML(c){
   // total uses size when known; remain = spendable, used = cycle spend.
   // Check-in adds packs → size/remain go UP (grant). Chat spend → used goes UP, remain DOWN.
@@ -619,7 +622,7 @@ async function showUsage(){
     const read=d.cached_tokens!==undefined?Number(d.cached_tokens)||0:sum(models,"cached_tokens");
     const write=d.cache_creation_tokens!==undefined?Number(d.cache_creation_tokens)||0:sum(models,"cache_creation_tokens");
     const input=sum(models,"input_tokens");
-    const rate=cacheRate(read,write,input);
+    const rate=cacheRate(read,input);
     const modelRows=models.map(x=>`<div class="p"><span>${esc(x.model)} · ${x.requests||0} 次</span><span>读 ${fmtTok(x.cached_tokens)} · 写 ${fmtTok(x.cache_creation_tokens)} · ${x.credits||0} 积分</span></div>`).join("")||"暂无";
     const entryRows=entries.slice(0,20).map(x=>`<div class="p"><span>${new Date(x.at*1000).toLocaleString()} · ${esc(x.model)}</span><span>读 ${fmtTok(x.cached_tokens)} · 写 ${fmtTok(x.cache_creation_tokens)} · ${x.credits||0} 积分</span></div>`).join("")||"暂无记录";
     box.style.display="block";
@@ -631,7 +634,7 @@ async function showUsage(){
       <div class="summary-grid">
         <div class="summary-item"><div class="k">缓存读取(命中)</div><div class="v ok">${fmtTok(read)}</div></div>
         <div class="summary-item"><div class="k">缓存写入</div><div class="v">${fmtTok(write)}</div></div>
-        <div class="summary-item"><div class="k">缓存命中率</div><div class="v ${rate>0?"ok":""}">${input+read+write>0?rate+"%":"-"}</div></div>
+        <div class="summary-item"><div class="k">缓存命中率</div><div class="v ${rate>0?"ok":""}">${input>0?rate.toFixed(1)+"%":"-"}</div></div>
         <div class="summary-item"><div class="k">输入 Token</div><div class="v">${fmtTok(input)}</div></div>
       </div>
       <div class="row"><span class="k">按模型</span><span class="v">${models.map(x=>esc(x.model)+": "+x.credits).join(" · ")||"暂无"}</span></div>
