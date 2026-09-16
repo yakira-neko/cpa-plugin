@@ -125,6 +125,8 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
 .modal-ft button.sec:hover{background:var(--btn-sec-hover)}
 /* Login modal: CN / Global region picker */
 .region-pick{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:4px 0 12px}
+/* Login diagnostics: redacted step log (shapes/statuses only, never tokens). */
+.lp-diag{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;line-height:1.5;color:var(--dim);word-break:break-all;padding:1px 0}
 .rp-opt{display:flex;flex-direction:column;gap:2px;padding:12px;border:1.5px solid var(--border);border-radius:10px;cursor:pointer;background:var(--input-bg);transition:border-color .15s,background .15s}
 .rp-opt:hover{border-color:var(--acc-ring)}
 .rp-opt.active{border-color:var(--acc);background:var(--acc-ring)}
@@ -651,6 +653,17 @@ async function api(path, opts={}){
     throw new Error("认证多次失败，请稍后重试（防 IP 封禁）");
   }
   const r=await fetch(API+path,{...opts,credentials:'omit',headers:{...(opts.headers||{}),...authHeaders(k)}});
+  if(r.status===429){
+    // Rate limited. Must NOT fall through to the generic parser: a 429 body has
+    // no "status" field, so pollLogin would treat it as pending and silently
+    // keep polling. Surface it so the wait is explainable, and back off.
+    const retryAfter=parseInt(r.headers.get("Retry-After")||"",10);
+    const waitMs=Number.isFinite(retryAfter)&&retryAfter>0?retryAfter*1000:6000;
+    const e=new Error("请求过于频繁（429），"+Math.ceil(waitMs/1000)+"s 后重试");
+    e.rateLimited=true;
+    e.retryAfterMs=waitMs;
+    throw e;
+  }
   if(r.status===401){
     authFailCount++;
     sessionStorage.removeItem(SS_KEY);
@@ -1017,6 +1030,25 @@ function scheduleLoginPoll(btn, delay){
   loginPollTimer=setTimeout(()=>pollLogin(btn), delay==null?LOGIN_POLL_MS:delay);
 }
 
+/* Render the redacted step log the backend returns, so a failure explains
+   itself instead of just saying "等待中" until the TTL expires. */
+function diagLines(d, max){
+  const list=(d&&d.diagnostics)||[];
+  if(!list.length)return "";
+  const tail=max&&list.length>max?list.slice(-max):list;
+  const rows=tail.map(x=>{
+    if(typeof x==="string")return '<div class="lp-diag">'+esc(x)+'</div>';
+    let s="["+esc(String(x.step||""))+"] "+esc(String(x.outcome||""));
+    if(x.count>1)s+=" ×"+esc(String(x.count));
+    if(x.http_status)s+=" · HTTP "+esc(String(x.http_status));
+    if(x.code)s+=" · code="+esc(String(x.code));
+    if(x.request_id)s+=" · rid="+esc(String(x.request_id).slice(0,8));
+    if(x.detail)s+=" — "+esc(String(x.detail));
+    return '<div class="lp-diag">'+s+'</div>';
+  }).join("");
+  return rows;
+}
+
 async function pollLogin(btn){
   const state=loginPollState;
   if(!state)return;
@@ -1024,6 +1056,13 @@ async function pollLogin(btn){
   try{
     d=await api("/login/poll",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({state})});
   }catch(e){
+    // Rate limited: back off for the window the server asked for instead of
+    // hammering at 2s and having most polls rejected.
+    if(e&&e.rateLimited){
+      loginStep('<div class="lp-step">⏳ 面板轮询被限流，'+Math.ceil((e.retryAfterMs||6000)/1000)+'s 后继续…</div>');
+      scheduleLoginPoll(btn, e.retryAfterMs||6000);
+      return;
+    }
     // Transient network/RPC hiccup: keep polling, the state TTL bounds it.
     scheduleLoginPoll(btn);
     return;
@@ -1034,7 +1073,8 @@ async function pollLogin(btn){
     const tag=d.region==="global"?"Global":"CN";
     loginStep(
       '<div class="lp-step done">✓ 登录成功</div>'+
-      '<div class="lp-step">'+esc(who)+' · '+tag+' · '+esc(d.domain||"")+'</div>'
+      '<div class="lp-step">'+esc(who)+' · '+tag+' · '+esc(d.domain||"")+'</div>'+
+      (d.warning?'<div class="lp-step err">⚠ '+esc(d.warning)+'</div>':"")
     );
     toast("登录成功","ok",who+"（"+tag+"）→ "+(d.name||""));
     await load(true);
@@ -1042,10 +1082,20 @@ async function pollLogin(btn){
   }
   if(d.status==="expired"||d.status==="error"){
     stopLoginPoll();
-    loginStep('<div class="lp-step err">✗ '+esc(d.error||"登录失败")+'</div>');
+    loginStep(
+      '<div class="lp-step err">✗ '+esc(d.error||"登录失败")+'</div>'+
+      diagLines(d,6)
+    );
     toast("登录失败","err",d.error||"");
     return;
   }
+  // Still pending — show live progress so an unusually slow poll is visible
+  // rather than looking frozen.
+  loginStep(
+    '<div class="lp-step">请在浏览器完成登录…</div>'+
+    (d.message?'<div class="lp-step">'+esc(d.message)+'</div>':"")+
+    diagLines(d,3)
+  );
   scheduleLoginPoll(btn);
 }
 

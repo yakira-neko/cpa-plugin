@@ -221,6 +221,16 @@ func init() {
 				}
 				return true
 			})
+			// Diagnostics for flows whose state is gone would otherwise live for
+			// the process lifetime. Keep a record only while its login flow is
+			// still live, so a failed login stays inspectable throughout its TTL
+			// (which is exactly when the user needs it) and nothing accumulates
+			// past it.
+			loginDiagPrune(func(state string) bool {
+				_, ok := loginStates.Load(state)
+				return ok
+			})
+			loginResultPrune()
 		}
 	}()
 }
@@ -538,10 +548,14 @@ type storedAccount struct {
 }
 
 // apiEnvelope is the generic {code,msg,data} wrapper used by every CodeBuddy API.
+// requestId is echoed by the gateway on every response and is the single most
+// useful field when asking upstream to trace a failed login, so it is captured
+// rather than dropped.
 type apiEnvelope struct {
-	Code int             `json:"code"`
-	Msg  string          `json:"msg"`
-	Data json.RawMessage `json:"data"`
+	Code      int             `json:"code"`
+	Msg       string          `json:"msg"`
+	Data      json.RawMessage `json:"data"`
+	RequestID string          `json:"requestId"`
 }
 
 type tokenData struct {

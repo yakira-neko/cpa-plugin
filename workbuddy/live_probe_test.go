@@ -242,12 +242,12 @@ func TestLivePanelLoginFlow(t *testing.T) {
 			break
 		}
 	}
-	fmt.Printf("\npolls=%d  rate-limited(429)=%d  (%.0f%% of polls wasted)\n",
+	fmt.Printf("\npolls=%d  rate-limited(429)=%d  (%.0f%% of polls rejected)\n",
 		attempt, rateLimited, 100*float64(rateLimited)/float64(max(attempt, 1)))
 	if rateLimited > 0 {
-		fmt.Printf("*** The panel's 2s cadence exceeds the 5-burst/1-per-6s bucket, so most\n")
-		fmt.Printf("*** polls are rejected. A 429 body has no \"status\" field, so panel.html:1049\n")
-		fmt.Printf("*** treats it as pending and keeps polling — the login looks stuck.\n")
+		fmt.Printf("The panel's 2s cadence exceeds the 5-burst/1-per-6s bucket, so most polls\n")
+		fmt.Printf("are rejected. The fix under test: a 429 is now surfaced (and backed off)\n")
+		fmt.Printf("by panel.html instead of being silently treated as \"still pending\".\n")
 	}
 
 	// ---- STEP 3: what the panel got -------------------------------------
@@ -255,13 +255,39 @@ func TestLivePanelLoginFlow(t *testing.T) {
 	if final == nil {
 		fmt.Printf("(no non-429 response received)\n")
 	} else {
-		keys := make([]string, 0, len(final))
-		for k := range final {
-			keys = append(keys, k)
+		for _, k := range []string{"status", "region", "uid", "nickname", "domain", "name", "path", "warning", "error", "upstream_code", "upstream_http", "request_id"} {
+			if v, ok := final[k]; ok && fmt.Sprint(v) != "" {
+				fmt.Printf("%-14s: %v\n", k, v)
+			}
 		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			fmt.Printf("%-9s: %v\n", k, final[k])
+		// Diagnostics: collapsed already, so this is the readable step log.
+		if diag, ok := final["diagnostics"].([]any); ok {
+			fmt.Printf("\ndiagnostics (%d entries, collapsed):\n", len(diag))
+			for _, x := range diag {
+				switch e := x.(type) {
+				case string:
+					fmt.Printf("  %s\n", e)
+				case map[string]any:
+					cnt := ""
+					if c, ok := e["count"].(float64); ok && c > 1 {
+						cnt = fmt.Sprintf(" x%.0f", c)
+					}
+					fmt.Printf("  [%v] %v%s", e["step"], e["outcome"], cnt)
+					if v, ok := e["http_status"]; ok {
+						fmt.Printf(" http=%v", v)
+					}
+					if v, ok := e["code"]; ok {
+						fmt.Printf(" code=%v", v)
+					}
+					if v, ok := e["request_id"].(string); ok && v != "" {
+						fmt.Printf(" rid=%s", v[:8])
+					}
+					if v, ok := e["detail"].(string); ok && v != "" {
+						fmt.Printf(" — %s", v)
+					}
+					fmt.Printf("\n")
+				}
+			}
 		}
 	}
 

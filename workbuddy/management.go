@@ -155,6 +155,7 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/login/poll", Description: "Poll a panel-started login (body: {state}); persists the credential on success."},
 			{Method: http.MethodGet, Path: base + "/login/config", Description: "Get the default region used by host-driven login."},
 			{Method: http.MethodPost, Path: base + "/login/config", Description: "Set the default region for host-driven login (body: {default_region})."},
+			{Method: http.MethodGet, Path: base + "/login/diag", Description: "Redacted step log of a login flow for failure diagnosis (query: ?state=; omit to list flows). Never contains token material."},
 			{Method: http.MethodPost, Path: base + "/trial", Description: "Claim expert trial pack for one Global account (auth_index). One-time 250 credits / 14 days."},
 			{Method: http.MethodPost, Path: base + "/select", Description: "Select the active account card used for chat routing (body: {auth_index})."},
 			{Method: http.MethodPost, Path: base + "/keepalive", Description: "Manually refresh access tokens for all accounts (or one with auth_index)."},
@@ -224,6 +225,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleLoginPoll(req)))
 	case req.Method == http.MethodGet && path == base+"/login/config":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleLoginConfig(req)))
+	case req.Method == http.MethodGet && path == base+"/login/diag":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleLoginDiag(req)))
 	case req.Method == http.MethodPost && path == base+"/login/config":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleLoginConfig(req)))
 	case req.Method == http.MethodPost && path == base+"/trial":
