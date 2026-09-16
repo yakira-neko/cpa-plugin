@@ -451,6 +451,8 @@ func wbRegistration() registration {
 				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeOff, schedulerModeCredits}, Description: "Multi-account selection: off (defer to built-in, default) or credits (pick highest remaining). WARNING: when off + lifecycle_auto=false, exhausted accounts may still be routed — enable lifecycle_auto or set scheduler_mode=credits."},
 				{Name: "usage_report_url", Type: pluginapi.ConfigFieldTypeString, Description: "Optional override of CPAMP usage import URL (default http://cpa-manager-plus:18317/v0/management/usage/import; also env USAGE_REPORT_URL)."},
 				{Name: "usage_report_key", Type: pluginapi.ConfigFieldTypeString, Description: "Optional CPAMP admin key override. Prefer auto-detect from env CPAMP_ADMIN_KEY / USAGE_REPORT_KEY or secret file /run/secrets/cpamp_admin_key."},
+				{Name: "tokens_per_credit", Type: pluginapi.ConfigFieldTypeNumber, Description: "Billable tokens per credit for the credits<->tokens rate card (default 1000). Raise it if the panel over-reports spend."},
+				{Name: "credit_rates", Type: pluginapi.ConfigFieldTypeString, Description: "Optional per-model cost-factor overrides for the credits<->tokens rate, e.g. \"glm-5.3=1.5,kimi-k2.7=0.8\". Factor 1.0 is the baseline; unknown models default to 1.0. See GET /creditlog/rates."},
 			},
 		},
 		Capabilities: registrationCapability{

@@ -32,9 +32,18 @@ func TestParseSessionIDFromRequest(t *testing.T) {
 // resetCreditLog isolates a test from the process-wide store.
 func resetCreditLog(t *testing.T) {
 	t.Helper()
-	t.Setenv("WB_CREDIT_LOG_PATH", filepath.Join(t.TempDir(), "usage.jsonl"))
+	dir := t.TempDir()
+	// Drain any write still in flight from an earlier test so it cannot land in
+	// this test's TempDir after cleanup.
+	waitCreditPersist()
+	t.Cleanup(waitCreditPersist)
+	t.Setenv("WB_CREDIT_LOG_PATH", filepath.Join(dir, "usage.jsonl"))
 	creditLog = &creditLogStore{byAuth: map[string]*creditAuthLog{}, sessions: map[string]*creditSession{}}
 	creditLogLoaded = false
+	// The rate card is process-wide too: a test that overrides a factor would
+	// otherwise leak into every later credit assertion.
+	resetCreditRates()
+	t.Cleanup(resetCreditRates)
 }
 
 // Cache reads and cache writes must be recorded as distinct counters: folding
@@ -150,5 +159,62 @@ func TestRealCacheHitFlowsThroughAccounting(t *testing.T) {
 	}
 	if _, ok := wire["cache_creation_tokens"]; !ok {
 		t.Error("panel JSON missing cache_creation_tokens")
+	}
+}
+
+// The upstream folds cache reads INTO prompt_tokens (live fixture:
+// prompt_tokens=4443 = 4043 cached + 400 miss). Pricing the raw prompt count
+// charged every cache hit twice — once at full input rate, then again at the
+// discounted cache rate — so the uncached remainder must be priced instead.
+//
+// Both requests below carry the same 4443 prompt tokens and the same 4043 cache
+// reads; the second adds 4043 genuinely-uncached tokens. Only the second may
+// cost more.
+func TestRecordCreditUsage_DoesNotDoubleCountCacheReads(t *testing.T) {
+	resetCreditLog(t)
+	at := time.Now()
+
+	// Cache-heavy: 400 uncached + 4043 cached.
+	recordCreditUsage("u-cache", "a1", "glm-5.3", "glm-5.3", at, usageDetailLite{
+		InputTokens:     4443,
+		OutputTokens:    10,
+		CacheReadTokens: 4043,
+	}, false, 200, "", time.Second, "")
+
+	// Same totals, but nothing cached: all 4443 prompt tokens are uncached.
+	recordCreditUsage("u-nocache", "a2", "glm-5.3", "glm-5.3", at, usageDetailLite{
+		InputTokens:     4443,
+		OutputTokens:    10,
+		CacheReadTokens: 0,
+	}, false, 200, "", time.Second, "")
+
+	cached := creditSnapshot("u-cache", 10, 24)["credits"].(int64)
+	uncached := creditSnapshot("u-nocache", 10, 24)["credits"].(int64)
+
+	if cached >= uncached {
+		t.Fatalf("cache-heavy request cost %d credits vs %d uncached: a cache hit must be strictly cheaper", cached, uncached)
+	}
+	// The input tokens STAYED raw for the panel's volume columns, even though
+	// only the uncached remainder was priced.
+	if got := creditSnapshot("u-cache", 10, 24)["input_tokens"].(int64); got != 4443 {
+		t.Fatalf("input_tokens=%d want 4443 (stored raw, not net of cache)", got)
+	}
+}
+
+// A cached count larger than the prompt count must not produce a negative
+// input charge (upstreams occasionally report the nested counter oddly).
+func TestRecordCreditUsage_CacheReadsExceedingInputClampToZero(t *testing.T) {
+	resetCreditLog(t)
+	recordCreditUsage("u-clamp", "a1", "glm-5.3", "glm-5.3", time.Now(), usageDetailLite{
+		InputTokens:     100,
+		OutputTokens:    50,
+		CacheReadTokens: 5000,
+	}, false, 200, "", time.Second, "")
+
+	got := creditSnapshot("u-clamp", 10, 24)["credits"].(int64)
+	// Output (50 x 1.5 = 75 weighted) + 5000 cached x 0.1 = 575 → 0.575 → 1.
+	// A negative input term would instead have wiped the output charge out.
+	if got != 1 {
+		t.Fatalf("credits=%d, want 1 (uncached input must clamp at 0, output still charged)", got)
 	}
 }

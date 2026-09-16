@@ -85,6 +85,18 @@ button.sec{background:var(--btn-sec);color:var(--fg)}button.sec:hover{background
 .v.ok{color:var(--ok)}.v.warn{color:var(--warn)}.v.err{color:var(--err)}
 .pkgs{margin-top:10px;font-size:12px;color:var(--mut)}
 .pkgs .p{display:flex;justify-content:space-between;padding:4px 0;border-top:1px solid var(--border)}
+/* 积分↔Token 换算表：五列（模型/倍率/输入/输出/缓存），用 grid 而非
+   space-between，否则数值列宽度随内容跳动、无法纵向对齐。 */
+.rt .p{display:grid;grid-template-columns:minmax(90px,1.4fr) 48px repeat(3,minmax(56px,1fr));gap:8px;align-items:baseline}
+.rt .p>span:not(:first-child){text-align:right;font-variant-numeric:tabular-nums}
+.rt .rt-head{color:var(--mut);font-weight:600;border-top:0;padding-bottom:6px}
+.rt .rt-head>span:not(:first-child){text-align:right}
+.ratecalc{margin-top:8px}
+.rc-fields{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.rc-fields label{display:flex;gap:6px;align-items:center;color:var(--mut);font-size:12px}
+.rc-fields input{width:96px;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;color:var(--fg);font-size:12px}
+.rc-fields input:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-ring)}
+.rc-fields button{padding:6px 12px;font-size:12px}
 .pb{margin-top:10px}
 .pb-label{display:flex;justify-content:space-between;font-size:12px;color:var(--mut);margin-bottom:6px}
 .pb-track{height:8px;background:var(--surface-muted);border-radius:99px;overflow:hidden}
@@ -608,9 +620,105 @@ function renderSummary(accounts){
     `}
   `;
 }
+/* ---------- 积分 ↔ Token 换算（按模型） ----------
+   The backend owns the rate card (creditrate.go) and exposes it at
+   /creditlog/rates; the panel only renders it. Keeping the math server-side
+   means the panel can never advertise a rate that contradicts the credits it
+   reports. Fetch is cached per page load — the table is static unless the
+   operator changes credit_rates and reloads. */
+let rateData=null;
+function rateFor(model){
+  if(!rateData||!rateData.models) return null;
+  const m=String(model||"").toLowerCase();
+  return rateData.models.find(x=>String(x.model||"").toLowerCase()===m)||null;
+}
+// fmtTokRate renders a tokens-per-credit figure: whole numbers stay plain,
+// fractional ones keep one decimal (e.g. 666.7).
+function fmtTokRate(n){
+  n=Number(n);
+  if(!isFinite(n)||n<=0) return "-";
+  if(n>=1000) return fmtTok(n);
+  return n>=100?String(Math.round(n)):n.toFixed(1);
+}
+async function loadRates(credits, share){
+  const q=new URLSearchParams();
+  if(credits>0) q.set("credits",String(credits));
+  if(share!==null&&share!==undefined&&share!=="") q.set("output_share",String(share));
+  const qs=q.toString();
+  rateData=await api("/creditlog/rates"+(qs?"?"+qs:""));
+  return rateData;
+}
+// rateTableHTML renders the per-model conversion table. When credits>0 the
+// backend also returns the "N credits buys M tokens" columns.
+function rateTableHTML(credits){
+  const rs=(rateData&&rateData.models)||[];
+  if(!rs.length) return "";
+  const withTok=credits>0;
+  const head=withTok
+    ?"<div class=\"p rt-head\"><span>模型</span><span>倍率</span><span>输入</span><span>输出</span><span>缓存</span></div>"
+    :"<div class=\"p rt-head\"><span>模型</span><span>倍率</span><span>1积分≈输入</span><span>1积分≈输出</span><span>1积分≈缓存</span></div>";
+  const rows=rs.map(r=>{
+    // Source badge: an override is the operator's own number, so mark it.
+    const src=r.source==="override"?" ✱":"";
+    const factor=(Number(r.factor)||0).toFixed(2).replace(/\.00$/,"").replace(/(\.\d)0$/,"$1");
+    const cells=withTok
+      ?`<span>${fmtTok(r.input_tokens)}</span><span>${fmtTok(r.output_tokens)}</span><span>${fmtTok(r.cached_tokens)}</span>`
+      :`<span>${fmtTokRate(r.tokens_per_credit_input)}</span><span>${fmtTokRate(r.tokens_per_credit_output)}</span><span>${fmtTokRate(r.tokens_per_credit_cached)}</span>`;
+    return `<div class="p"><span>${esc(r.model)}${src}</span><span>${factor}×</span>${cells}</div>`;
+  }).join("");
+  const caption=withTok
+    ?`${credits} 积分 ≈ 各模型可换 Token（估算 · 输出占比 ${Math.round((Number(rateData.output_share)||0)*100)}%）`
+    :"1 积分 ≈ 各模型可换 Token（估算 · 输入/输出/缓存分别计价）";
+  return `<details class="pkgs" open><summary>${caption}</summary>
+    <div class="rt">${head}${rows}</div>
+    <div class="pb-meta">${esc((rateData&&rateData.note)||"")}${rs.some(r=>r.source==="override")?" ✱ = credit_rates 覆盖":""}</div>
+  </details>`;
+}
+// rateCalcHTML is the interactive estimator: enter a credit budget, get the
+// token equivalent per model. Without a budget it shows the 1-credit rate card.
+function rateCalcHTML(credits, share){
+  return `
+  <div class="ratecalc">
+    <div class="rc-fields">
+      <label>积分<input id="rcCredits" type="number" min="0" step="any" value="${credits>0?credits:""}" placeholder="如 100"></label>
+      <label>输出占比<input id="rcShare" type="number" min="0" max="1" step="0.05" value="${share!=null?share:""}" placeholder="0.25"></label>
+      <button type="button" class="sec" onclick="convertRates(this)">换算</button>
+      <button type="button" class="sec" onclick="convertRates(this,null)">仅看 1 积分</button>
+    </div>
+    <div id="rcOut">${rateTableHTML(credits)}</div>
+  </div>`;
+}
+async function convertRates(btn, creditsOverride){
+  const creditsEl=document.getElementById("rcCredits");
+  const shareEl=document.getElementById("rcShare");
+  const out=document.getElementById("rcOut");
+  if(!out) return;
+  const credits=creditsOverride===null?0:(Number(creditsEl&&creditsEl.value)||0);
+  if(credits<0){
+    toast("积分需为正数","err");
+    return;
+  }
+  const rawShare=shareEl&&shareEl.value!==""?Number(shareEl.value):undefined;
+  if(rawShare!==undefined&&(isNaN(rawShare)||rawShare<0||rawShare>1)){
+    toast("输出占比需在 0 ~ 1 之间","err");
+    return;
+  }
+  busy(btn,true);
+  try{
+    await loadRates(credits, rawShare===undefined?undefined:rawShare);
+    out.innerHTML=rateTableHTML(credits);
+  }catch(e){
+    toast("换算失败","err",e.message||String(e));
+  }finally{
+    busy(btn,false);
+  }
+}
 async function showUsage(){
   try{
     const d=await api("/creditlog?limit=80");
+    // Rate card is fetched alongside the log so per-model rows can show the
+    // model's own 1-credit equivalent instead of a single global number.
+    try{ await loadRates(0,null); }catch(_){}
     const box=document.getElementById("summaryBox");
     const models=d.models||[], entries=d.entries||[];
     // Totals come from the snapshot aggregate; fall back to summing entries so
@@ -620,7 +728,11 @@ async function showUsage(){
     const write=d.cache_creation_tokens!==undefined?Number(d.cache_creation_tokens)||0:sum(models,"cache_creation_tokens");
     const input=sum(models,"input_tokens");
     const rate=cacheRate(read,write,input);
-    const modelRows=models.map(x=>`<div class="p"><span>${esc(x.model)} · ${x.requests||0} 次</span><span>读 ${fmtTok(x.cached_tokens)} · 写 ${fmtTok(x.cache_creation_tokens)} · ${x.credits||0} 积分</span></div>`).join("")||"暂无";
+    const modelRows=models.map(x=>{
+      const r=rateFor(x.model);
+      const rt=r?` · 1积分≈${fmtTokRate(r.tokens_per_credit_input)}入/${fmtTokRate(r.tokens_per_credit_output)}出`:"";
+      return `<div class="p"><span>${esc(x.model)} · ${x.requests||0} 次</span><span>读 ${fmtTok(x.cached_tokens)} · 写 ${fmtTok(x.cache_creation_tokens)} · ${x.credits||0} 积分${rt}</span></div>`;
+    }).join("")||"暂无";
     const entryRows=entries.slice(0,20).map(x=>`<div class="p"><span>${new Date(x.at*1000).toLocaleString()} · ${esc(x.model)}</span><span>读 ${fmtTok(x.cached_tokens)} · 写 ${fmtTok(x.cache_creation_tokens)} · ${x.credits||0} 积分</span></div>`).join("")||"暂无记录";
     box.style.display="block";
     box.innerHTML=`
@@ -636,6 +748,7 @@ async function showUsage(){
       </div>
       <div class="row"><span class="k">按模型</span><span class="v">${models.map(x=>esc(x.model)+": "+x.credits).join(" · ")||"暂无"}</span></div>
       <div class="row"><span class="k">按时段</span><span class="v">${(d.hours||[]).map(x=>x.hour+":00 "+x.credits).join(" · ")||"暂无"}</span></div>
+      <details class="pkgs" open><summary>积分 ↔ Token 换算（按模型）</summary>${rateCalcHTML(0,null)}</details>
       <details class="pkgs" open><summary>按模型 Token 明细</summary>${modelRows}</details>
       <details class="pkgs" open><summary>最近请求（缓存读/写）</summary>${entryRows}</details>`;
     box.scrollIntoView({behavior:"smooth"});

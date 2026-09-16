@@ -24,6 +24,9 @@
 - **Trial 领取** — Global 账号可在面板领取一次性 250 积分专家加油包。
 - **积分面板** — 内嵌面板 `/v0/resource/plugins/workbuddy/panel`，含积分
   进度条、套餐徽章、耗尽/禁用标记、CN/Global 筛选、凭证导入、CN/Global 登录。
+- **积分 ↔ Token 换算** — 按模型维护一张费率表，同时驱动「每次请求积分估算」和
+  面板换算器（「N 积分 ≈ 多少 token」）。模型系数可用配置覆盖，见
+  `GET /creditlog/rates`。
 - **调度器**（可选） — `scheduler_mode: credits` 让插件选中面板选中的账号；
   `off`（默认）完全交给 CPA 内置调度。
 - **Usage 上报** — 实现 `UsagePlugin` 能力，每条请求的 usage record 转发到
@@ -125,7 +128,38 @@ plugins:
       # 写端点要求该 Bearer token。空（默认）则只靠宿主 management middleware。
       # 也可从 WB_MANAGEMENT_KEY 环境变量读。
       management_key: ""
+
+      # --- 积分 ↔ Token 费率表（均可选）---------------------------------
+      # 每积分对应的计费 token 数（默认 1000）。面板偏高就调大，偏低就调小。
+      tokens_per_credit: 1000
+
+      # 按模型覆盖计费系数，格式 "模型=系数"，逗号分隔。系数 1.0 为基准；
+      # 系数只作用于 **输出** token（输入不缩放）。未知模型按 1.0 计。
+      # 内置表可在 GET .../creditlog/rates 查看。
+      credit_rates: "glm-5.3=1.5,kimi-k2.7=0.8,glm-5.3-flash=0.5"
 ```
+
+### 积分 ↔ Token 费率表
+
+CodeBuddy 不上报单请求积分，所以每次请求的消耗由 token 数估算：
+
+```
+积分 = (未命中缓存的输入 + 输出 × 模型系数 + 缓存读取 × 缓存系数)
+       / tokens_per_credit
+```
+
+输入按 **扣除缓存读取后** 计费，因为上游把缓存命中数并入了 `prompt_tokens`。
+同一张表也用于反算，所以面板显示的「1 积分 ≈ N token」永远和它统计的积分一致。
+
+```bash
+# 所有已知模型的费率
+curl ".../creditlog/rates" -H "Authorization: Bearer $MGMT_KEY"
+
+# 100 积分能换多少 token？（输出占比默认 0.25）
+curl ".../creditlog/rates?credits=100&output_share=0.25" -H "Authorization: Bearer $MGMT_KEY"
+```
+
+面板「消耗明细 → 积分 ↔ Token 换算」提供同样的交互式换算。
 
 模型 alias 和排除走 CPA 原生 `oauth-model-alias` 和 `oauth-excluded-models`
 配置，无需插件侧重复。

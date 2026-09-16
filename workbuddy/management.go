@@ -150,6 +150,7 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodGet, Path: base + "/credits", Description: "Get real-time credits for one (auth_index query) or all accounts."},
 			{Method: http.MethodGet, Path: base + "/creditlog", Description: "Request-level credit usage, model/hour/session aggregates."},
 			{Method: http.MethodGet, Path: base + "/creditlog/summary", Description: "Global credit usage summary."},
+			{Method: http.MethodGet, Path: base + "/creditlog/rates", Description: "Per-model credits<->tokens rate card; ?credits=N converts N credits to tokens per model (?output_share=0..1)."},
 			{Method: http.MethodPost, Path: base + "/import", Description: "Import WorkBuddy credential JSON (nested or flat) into host auth store."},
 			{Method: http.MethodPost, Path: base + "/login/start", Description: "Start a CN or Global OAuth login (body: {region}); returns browser URL + state."},
 			{Method: http.MethodPost, Path: base + "/login/poll", Description: "Poll a panel-started login (body: {state}); persists the credential on success."},
@@ -216,6 +217,13 @@ func handleManagement(raw []byte) ([]byte, error) {
 		}})))
 	case req.Method == http.MethodGet && path == base+"/creditlog/summary":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCreditLogSummary()))
+	case req.Method == http.MethodGet && path == base+"/creditlog/rates":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCreditRates(mgmtRequestLite{Raw: req.Body, Query: func(k string) string {
+			if v := req.Query[k]; len(v) > 0 {
+				return v[0]
+			}
+			return ""
+		}})))
 	case req.Method == http.MethodPost && path == base+"/import":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleImportAuth(req)))
 	case req.Method == http.MethodPost && path == base+"/login/start":

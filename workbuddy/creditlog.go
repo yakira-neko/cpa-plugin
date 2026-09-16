@@ -13,23 +13,19 @@
 //     in a global "default" session.
 //
 // Credit estimation: CodeBuddy does not report credits per request; the
-// billing API only exposes cycle-level remain/used per package. We therefore
-// estimate request cost as
-//
-//	credits 鈮?round((input + cached_tokens脳cacheFactor + output
-//	             + reasoning) / tokensPerCredit 脳 modelFactor)
-//
-// with per-model factors from the static model table (see creditModelFactor)
-// and package-level est_credits derived from the same math. Estimates are
-// always labeled as estimates ("鈮?) in the panel; the authoritative numbers
-// remain the billing API's remain/used.
+// billing API only exposes cycle-level remain/used per package. Request cost is
+// therefore estimated from token counts by the rate card in creditrate.go —
+// the same table that answers the reverse question ("how many tokens does one
+// credit buy"). See that file for the formula and its caveats.
 package main
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -51,11 +47,6 @@ const (
 	creditLogPruneInterval = 30 * time.Minute
 	// creditSessionsCap bounds session summaries retained globally.
 	creditSessionsCap = 256
-	// tokensPerCredit is the CodeBuddy coding-plan conversion used for
-	// estimates: 1 credit 鈮?1000 tokens at factor 1.0 models.
-	tokensPerCredit = 1000
-	// cachedTokensFactor discounts prompt-cache hits (cheap to serve).
-	cachedTokensFactor = 0.1
 	// creditSessionIdle expires a session after this much inactivity.
 	creditSessionIdle = 30 * time.Minute
 )
@@ -124,6 +115,17 @@ type creditLogStore struct {
 var creditLog = &creditLogStore{byAuth: map[string]*creditAuthLog{}, sessions: map[string]*creditSession{}}
 var creditLogPersistMu sync.Mutex
 var creditLogLoaded bool
+
+// creditPersistWG tracks in-flight async persistence goroutines. The write is
+// fire-and-forget on the hot path (the executor must never block on disk), but
+// tests need to drain them before a t.TempDir() is removed — otherwise a
+// goroutine lands a write after cleanup and fails the test with a bogus
+// "directory is not empty" error.
+var creditPersistWG sync.WaitGroup
+
+// waitCreditPersist blocks until every queued persistence write has finished.
+// Test-facing only; production never waits.
+func waitCreditPersist() { creditPersistWG.Wait() }
 
 func creditLogPath() string {
 	if p := strings.TrimSpace(os.Getenv("WB_CREDIT_LOG_PATH")); p != "" {
@@ -204,7 +206,17 @@ func recordCreditUsage(authUID, authIndex, alias, model string, started time.Tim
 	if total == 0 {
 		total = in + out + cacheRead + cacheWrite
 	}
-	est := estimateCredits(model, in, out, cacheRead)
+	// The upstream folds prompt-cache hits INTO prompt_tokens (live fixture in
+	// usage_detail_test.go: prompt_tokens=4443 = 4043 cached + 400 miss), so
+	// the cache-read count must be subtracted before pricing the input class.
+	// Passing the raw prompt count charged every cache hit twice: once at full
+	// input rate, then again at the discounted cache rate. Input is still
+	// STORED raw so the panel keeps showing true prompt volume.
+	uncachedIn := in - cacheRead
+	if uncachedIn < 0 {
+		uncachedIn = 0
+	}
+	est := estimateCredits(model, uncachedIn, out, cacheRead)
 	entry := creditEntry{
 		At:         at.Unix(),
 		Model:      model,
@@ -230,7 +242,11 @@ func recordCreditUsage(authUID, authIndex, alias, model string, started time.Tim
 	defer creditLog.mu.Unlock()
 	creditLog.appendLocked(authUID, entry)
 	creditLog.foldSessionLocked(entry, key, at)
-	go persistCreditEntry(entry)
+	creditPersistWG.Add(1)
+	go func() {
+		defer creditPersistWG.Done()
+		persistCreditEntry(entry)
+	}()
 }
 
 // appendLocked stores the entry in the per-auth ring buffer, evicting the
@@ -343,48 +359,6 @@ type usageDetailLite struct {
 	CacheReadTokens     int64
 	CacheCreationTokens int64
 	TotalTokens         int64
-}
-
-// -----------------------------------------------------------------------------
-// Credit estimation
-// -----------------------------------------------------------------------------
-
-// estimateCredits returns the estimated credits for one request. The result is
-// rounded (鈮? for any non-zero spend) so the panel shows integers.
-func estimateCredits(model string, input, output, cached int64) int64 {
-	weighted := float64(input) +
-		float64(output)*creditModelFactor(model) +
-		float64(cached)*cachedTokensFactor
-	if weighted <= 0 {
-		return 0
-	}
-	credits := weighted / tokensPerCredit
-	if credits < 1 {
-		// Small requests still consume a chargeable unit in practice; report
-		// 鈮? so totals never under-count sparse but real usage.
-		return 1
-	}
-	return int64(credits + 0.5)
-}
-
-// creditModelFactor returns the relative cost factor of a model. CodeBuddy
-// publishes per-model pricing only inside the web app; the plugin's static
-// model table carries a stable approximation (expert-tier models cost more
-// than lightweight ones). Unknown models fall back to 1.0.
-func creditModelFactor(model string) float64 {
-	m := strings.ToLower(strings.TrimSpace(model))
-	switch m {
-	case "glm-5.3", "glm-5.2", "kimi-k3-1", "deepseek-v4-pro", "hy4-preview-x":
-		return 1.5
-	case "glm-5.1", "glm-5v-turbo", "minimax-m3", "hy4-preview", "hy3-x", "hy3":
-		return 1.0
-	case "kimi-k2.7", "kimi-k2.6", "hy3-preview", "hy3-preview-agent":
-		return 0.8
-	case "glm-5.3-flash", "deepseek-v4-flash", "deepseek-v4.1-flash":
-		return 0.5
-	default:
-		return 1.0
-	}
 }
 
 // -----------------------------------------------------------------------------
@@ -706,6 +680,43 @@ func atoiDefault(s string, def int) int {
 // handleCreditLogSummary serves GET /creditlog/summary (global rollup).
 func handleCreditLogSummary() map[string]any {
 	return creditGlobalSummary()
+}
+
+// handleCreditRates serves GET /creditlog/rates: the per-model credits <-> token
+// rate card behind every estimate, and — when ?credits= is supplied — how many
+// tokens that many credits buys on each model.
+//
+// Query params:
+//
+//	credits=<n>       optional; enables the per-model token conversion columns
+//	output_share=<f>  optional completion share of the billable mix, 0..1
+func handleCreditRates(req mgmtRequestLite) map[string]any {
+	creditsRaw := strings.TrimSpace(req.Query("credits"))
+	withCredits := creditsRaw != ""
+	credits := parseFloatDefault(creditsRaw, 0)
+	if withCredits && credits <= 0 {
+		// A malformed/zero amount would otherwise render "0 tokens" for every
+		// model, which reads like a broken rate card rather than bad input.
+		return map[string]any{"error": "credits must be a positive number"}
+	}
+	share := parseFloatDefault(strings.TrimSpace(req.Query("output_share")), defaultOutputShare)
+	if share < 0 || share > 1 {
+		return map[string]any{"error": "output_share must be between 0 and 1"}
+	}
+	return creditRatesReport(credits, share, withCredits)
+}
+
+// parseFloatDefault parses s as a float64, returning def when empty/invalid.
+func parseFloatDefault(s string, def float64) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return def
+	}
+	return v
 }
 
 // parseSessionIDFromRequest best-effort extracts a session identifier from the

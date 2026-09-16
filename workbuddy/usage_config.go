@@ -96,6 +96,13 @@ func configure(raw []byte) {
 	nextKeepaliveAuto := true
 	nextMgmtKey := ""
 	nextDefaultRegion := ""
+	// Credit rate card overrides. Empty config means "keep the built-in table";
+	// a non-empty value replaces the whole override set so removing a line from
+	// config.yaml actually reverts that model.
+	cfgCreditRates := ""
+	cfgCreditRatesSet := false
+	cfgTokensPerCredit := ""
+	cfgTokensPerCreditSet := false
 
 	cfgURL, cfgKey := "", ""
 	if len(raw) > 0 {
@@ -142,6 +149,16 @@ func configure(raw []byte) {
 					v := strings.TrimSpace(strings.TrimPrefix(line, "default_region:"))
 					nextDefaultRegion = strings.Trim(v, "\"'")
 				}
+				if strings.HasPrefix(line, "credit_rates:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "credit_rates:"))
+					cfgCreditRates = strings.Trim(v, "\"'")
+					cfgCreditRatesSet = true
+				}
+				if strings.HasPrefix(line, "tokens_per_credit:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "tokens_per_credit:"))
+					cfgTokensPerCredit = strings.Trim(v, "\"'")
+					cfgTokensPerCreditSet = true
+				}
 			}
 		}
 	}
@@ -178,8 +195,24 @@ func configure(raw []byte) {
 	}
 	setDefaultLoginRegion(nextDefaultRegion)
 
+	applyCreditRateConfig(cfgCreditRates, cfgCreditRatesSet, cfgTokensPerCredit, cfgTokensPerCreditSet)
+
 	resolveUsageReport(cfgURL, cfgKey)
 	ensureScheduler()
+}
+
+// applyCreditRateConfig installs the credit rate card overrides. Each field is
+// only touched when the config actually declared it, so a reconfigure that
+// omits credit_rates keeps the previous state instead of silently reverting to
+// the built-in table. When a field IS declared, its value (including empty)
+// replaces the previous one — deleting a line from config.yaml reverts it.
+func applyCreditRateConfig(rates string, ratesSet bool, tpc string, tpcSet bool) {
+	if ratesSet {
+		overrideCreditRates(parseCreditRates(rates))
+	}
+	if tpcSet {
+		overrideTokensPerCredit(parseFloatDefault(tpc, defaultTokensPerCredit))
+	}
 }
 
 // resolveUsageReport fills usageReportURL/key from config → env → secret files.

@@ -34,7 +34,30 @@ go test -cover ./...
 go test -coverprofile=coverage.out ./... && go tool cover -html=coverage.out
 ```
 
-The test suite (115 tests at the time of writing) covers:
+### No C compiler on the host?
+
+The plugin is `package main` with `import "C"` in `main.go`, so `go build`,
+`go vet` and `go test` all require a C toolchain (Go's cgo driver wants
+`gcc`/`clang`; MSVC `cl` is not enough). On a Windows box without one, use the
+repo-level harness, which copies the package to a scratch dir, strips only the
+cgo layer from `main.go`, and runs the real test suite there:
+
+```powershell
+pwsh -File ../scripts/verify-plugin.ps1 -Plugin workbuddy
+```
+
+`scripts/strip_cgo.py` performs the strip and fails loudly if an anchor stops
+matching, so it cannot silently stop checking something. The panel's new
+积分 ↔ Token rendering has its own headless check (needs `node`):
+
+```bash
+python3 scripts/check_panel_rates.py
+```
+
+The C ABI layer itself (the `//export`ed functions and `hostCall`'s cgo path)
+is only compiled by CI on the ubuntu/macos/windows runners.
+
+The test suite (178 tests at the time of writing) covers:
 
 - Cache merge logic (credits / plan / checkin never wiped on fast paths)
 - Alias reverse resolution (client alias → upstream model id)
@@ -43,6 +66,11 @@ The test suite (115 tests at the time of writing) covers:
 - UID sanitization for auth file names (path traversal defense)
 - Scheduler pick behavior (sticky + fallback + `scheduler_mode: off` defers)
 - Credits lifecycle transitions (exhausted → disable / delete / re-enable)
+- Credits ↔ tokens rate card (both directions, round-trip inverse, per-model
+  divergence, config overrides, malformed-config tolerance, and the JSON field
+  names the panel reads)
+- Cache accounting (reads priced at the discounted rate exactly once — pricing
+  the raw prompt count double-charged every cache hit)
 
 ## Lint
 

@@ -108,6 +108,48 @@ in-panel flow.
     `prompt_cache_write_tokens` / `prompt_cache_miss_tokens`, which are not
     parsed. They carry the same read/write information as the keys above, so
     nothing is lost; wiring them would be redundant.
+- Added per-model credits ↔ tokens conversion (`creditrate.go`,
+  `GET /creditlog/rates`, panel 换算 UI).
+  - `creditrate.go` (new) — the rate card is now a single table that answers
+    both directions. `creditsForTokens` is the forward (spend) conversion and
+    `tokensForCredits` / `tokensForCreditsBlended` are its exact inverse, so the
+    rate the panel advertises can never contradict the credits it reports.
+    Three billable classes are priced separately:
+    `credits = (uncached_input + output×factor + cached×cache_factor) / tokens_per_credit`.
+  - `creditrate.go` — the per-model factor is operator-overridable via
+    `credit_rates` (`"glm-5.3=1.5,kimi-k2.7=0.8"`), and the scale via
+    `tokens_per_credit` (default 1000). Overrides replace the whole set on each
+    configure, so deleting a line from `config.yaml` actually reverts that model
+    instead of leaving a stale factor behind. A malformed entry is skipped
+    rather than discarding the operator's other corrections.
+  - `creditlog.go` — the duplicated factor table and forward formula were
+    removed; `estimateCredits` now delegates to `creditsForTokens`, so the
+    estimate and the published rate share one implementation.
+  - **Fix** — cache reads were charged twice. The upstream folds prompt-cache
+    hits INTO `prompt_tokens` (the pinned live fixture:
+    `prompt_tokens=4443` = 4043 cached + 400 miss), so pricing the raw prompt
+    count billed each hit once at full input rate and again at the discounted
+    cache rate. Input is now net of cache reads before pricing, which makes a
+    cache-heavy request *cheaper* than the same volume uncached — previously it
+    cost strictly more (regression test:
+    `TestRecordCreditUsage_DoesNotDoubleCountCacheReads`). The stored
+    `input_tokens` stays raw so the panel's volume columns remain truthful.
+  - `management.go` — new `GET .../creditlog/rates`, registered in the
+    management API. Without query params it returns the rate card only; with
+    `?credits=N` it adds the per-model `N credits → M tokens` columns, and
+    `?output_share=0..1` picks the completion share of the mix. Bad input
+    returns an error rather than a table of zeros.
+  - `panel.html` — the 消耗明细 view gained a 积分 ↔ Token 换算 section: an
+    interactive estimator (enter a credit budget + optional output share, get
+    the per-model token equivalent) plus a per-model rate table that marks
+    config-overridden factors with ✱. Per-model rows in the existing Token
+    detail also show their own `1积分≈N入/M出`.
+  - Tests — 33 new cases in `creditrate_test.go` /
+    `creditrate_contract_test.go` cover both conversion directions, the
+    round-trip inverse, per-model divergence, override precedence and
+    replacement, malformed-config tolerance, the handler's validation, and the
+    exact JSON field names the panel reads (a rename would otherwise silently
+    render "-" instead of failing).
 
 ## 0.8.2
 

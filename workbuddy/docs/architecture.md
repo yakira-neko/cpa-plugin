@@ -13,7 +13,7 @@ driven via the `pluginabi` RPC interface.
 | `Executor` | `executor.go`, `stream.go`, `payload.go` | Chat completions, streaming SSE pump, request body rewriting |
 | `Scheduler` | `scheduler.go`, `active_auth.go` | Optional panel-selected account routing (`scheduler_mode: credits`) |
 | `ManagementAPI` | `management.go`, `panel.go`, `checkin.go`, `credits_handler.go`, `billing.go`, `usage_config.go`, `host_auth.go` | Dashboard, manual check-in, credits query, import credential, config |
-| `UsagePlugin` | `usage.go` | Forward every request's usage record to CPAMP |
+| `UsagePlugin` | `usage.go`, `creditlog.go`, `creditrate.go` | Forward every request's usage record to CPAMP; estimate per-request credits and expose the per-model credits ↔ tokens rate card |
 
 ## File map (by responsibility)
 
@@ -63,6 +63,12 @@ scheduler.go      handleSchedulerPick + candidateDisabled + cachedCreditsScore
 active_auth.go    activeAuthID sticky state + pickActiveAuth + clearActiveAuthIfMatch
 
 cache.go          accountCache + accountDetailFlight singleflight + prune
+creditrate.go     Per-model credits <-> tokens rate card: modelCreditFactor +
+                  creditsForTokens (forward, single source of truth for spend) +
+                  tokensForCredits/Blended (exact inverse) + overrideTokensPerCredit
+                  + parseCreditRates + creditRatesReport
+creditlog.go      recordCreditUsage + ring buffer + creditSnapshot/creditGlobalSummary
+                  + handleCreditLogQuery/Summary/Rates + janitor
 redact.go         redactSecrets + 4 regex + truncateRedacted + truncate
 headers.go        (in main.go / oauth.go) commonHeaders/backendHeaders/billingHeaders
 stored.go         (in main.go / models.go) storedAuth/storedTokens/storedAccount
@@ -197,6 +203,30 @@ panel.html → /v0/management/plugins/workbuddy/accounts
    Provider/BaseURL/Host/HTTPClient/Metadata). Rather than fork host behaviour,
    the plugin exposes its own `/login/start` + `/login/poll` routes that the
    panel drives, and honours `default_region` for the host card.
+
+10. **One rate card answers both directions.** CodeBuddy never reports credits
+    per request, so spend is estimated from tokens. Rather than let the estimate
+    and the panel's advertised "1 credit ≈ N tokens" drift apart as two separate
+    formulas, both derive from `creditrate.go`:
+
+    ```
+    credits = (uncached_input + output×factor + cached×cache_factor) / tokens_per_credit
+    ```
+
+    `tokensForCredits` is the algebraic inverse, and a round-trip test asserts it
+    (`TestTokensForCredits_InvertsForwardConversion`). Consequences worth noting:
+
+    - **Input is net of cache reads.** The upstream folds cache hits into
+      `prompt_tokens` (live fixture: 4443 = 4043 cached + 400 miss), so pricing
+      the raw count charged every hit twice — once at full input rate, once at
+      the discounted cache rate. A cache-heavy request used to cost *more* than
+      the same volume uncached.
+    - **The factor scales output only.** Input is the un-scaled baseline; that
+      asymmetry is what makes per-model token rates differ at all.
+    - The factors are an approximation (real pricing lives in CodeBuddy's web
+      app), so `credit_rates` overrides them per model from `config.yaml`
+      without a rebuild, and overrides replace the whole set each configure so
+      deleting a line genuinely reverts it.
 
 ## Integration points with CPA
 

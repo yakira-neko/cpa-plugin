@@ -33,6 +33,10 @@ dashboard.
 - **Dashboard** — embedded panel at `/v0/resource/plugins/workbuddy/panel`
   with credits progress bars, plan badges, exhausted/disabled flags, region
   filter, credential import, and CN/Global sign-in.
+- **Credits ↔ tokens conversion** — a per-model rate card powers both the
+  per-request spend estimate and a panel calculator that answers "N credits ≈
+  how many tokens". Factors are overridable from config; see
+  `GET /creditlog/rates`.
 - **Scheduler** (optional) — `scheduler_mode: credits` makes the plugin pick
   the panel-selected account; `off` (default) defers to CPA's built-in
   scheduler entirely.
@@ -147,7 +151,42 @@ plugins:
       # When empty (default) the host's management middleware is the only
       # guard. Also readable from WB_MANAGEMENT_KEY env var.
       management_key: ""
+
+      # --- Credits <-> tokens rate card (all optional) -------------------
+      # Billable tokens per credit (default 1000). Raise it if the panel
+      # over-reports spend, lower it if it under-reports.
+      tokens_per_credit: 1000
+
+      # Per-model cost-factor overrides, as "model=factor" pairs. Factor 1.0 is
+      # the baseline; the factor scales OUTPUT tokens (input is un-scaled).
+      # Unknown models default to 1.0. Inspect the built-in table at
+      # GET /v0/management/plugins/workbuddy/creditlog/rates
+      credit_rates: "glm-5.3=1.5,kimi-k2.7=0.8,glm-5.3-flash=0.5"
 ```
+
+### Credits ↔ tokens rate card
+
+CodeBuddy does not report credits per request, so per-request spend is
+estimated from token counts:
+
+```
+credits = (uncached_input + output × model_factor + cached × cache_factor)
+          / tokens_per_credit
+```
+
+Input is priced **net of cache reads**, because the upstream folds prompt-cache
+hits into `prompt_tokens`. The same table answers the reverse question, so the
+panel's "1 credit ≈ N tokens" figure always matches the credits it reports.
+
+```bash
+# Rate card for every known model
+curl ".../creditlog/rates" -H "Authorization: Bearer $MGMT_KEY"
+
+# How many tokens does 100 credits buy? (default output share 0.25)
+curl ".../creditlog/rates?credits=100&output_share=0.25" -H "Authorization: Bearer $MGMT_KEY"
+```
+
+The panel exposes the same thing interactively in 消耗明细 → 积分 ↔ Token 换算.
 
 Model aliases and exclusions are handled natively by CPA's
 `oauth-model-alias` and `oauth-excluded-models` config — no plugin-side
