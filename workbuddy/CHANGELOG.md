@@ -178,6 +178,14 @@ in-panel flow.
   - `panel.html` — the 消耗明细 view shows 缓存读取(命中) / 缓存写入 /
     缓存命中率 / 输入 Token cards plus per-model and recent-request cache
     read/write columns.
+  - `panel.html` — 缓存命中率 was computed over the wrong denominator. It read
+    `reads / (input + reads + writes)`, but the upstream's input/prompt token
+    count is already cache-INCLUSIVE (the pinned fixture: `prompt_tokens=4443`
+    = 4043 cached + 400 miss), so cache reads are a subset of the denominator
+    and adding the read/write counters double-counted them — and inflating the
+    base with cache writes made the rate read low on every cache-writing
+    request. The rate is now `缓存读取(命中) / 输入 Token`, shown with one
+    decimal place. `cacheRate()` lost its now-unused write parameter.
   - Live-verified against `copilot.tencent.com/v2/chat/completions` (glm-5.3):
     on a real prompt-cache hit the upstream returns
     `prompt_tokens_details.cached_tokens=4043` while the **flat**
