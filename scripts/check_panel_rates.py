@@ -143,6 +143,8 @@ DRIVER = r"""
 // --- drive the new rate-rendering code ---------------------------------------
 const out = {};
 const checks = (name, val) => { out[name] = !!val; };
+// The panel's own source, for assertions about call sites (not just behaviour).
+const panelSource = __PANEL_SOURCE__;
 
 rateData = __RATES_WITH__;
 checks("rateFor_exact", rateFor("glm-5.3"));
@@ -184,6 +186,23 @@ rateData = null;
 checks("table_empty_when_no_rates", rateTableHTML(0) === "");
 checks("rateFor_null_safe", rateFor("glm-5.3") === null);
 
+// --- cache-hit rate ----------------------------------------------------------
+// cacheRate(reads, input). The upstream's prompt count is cache-INCLUSIVE, so
+// reads are a subset of the denominator and the write counter must stay out of
+// it. Regression guard: the rate was once computed over
+// (input + reads + writes), which double-counted the reads and read low
+// whenever a cache write occurred.
+checks("cacheRate_live_fixture", Math.abs(cacheRate(4043, 4443) - 91.0) < 0.15);
+checks("cacheRate_no_reads_is_zero", cacheRate(0, 1000) === 0);
+checks("cacheRate_half", cacheRate(500, 1000) === 50);
+checks("cacheRate_zero_input_is_zero", cacheRate(10, 0) === 0);
+checks("cacheRate_all_cached", cacheRate(1000, 1000) === 100);
+// The write counter is no longer a parameter — pin the arity and the call site
+// so a stale three-argument call cannot creep back in.
+checks("cacheRate_arity_is_two", cacheRate.length === 2);
+checks("cacheRate_call_site_two_args", /cacheRate\(read,\s*input\)/.test(panelSource));
+checks("cacheRate_call_site_no_write_arg", !/cacheRate\(read,\s*write/.test(panelSource));
+
 console.log(JSON.stringify(out));
 """
 
@@ -198,6 +217,9 @@ def main() -> int:
     driver = (
         DRIVER.replace("__RATES_WITH__", json.dumps(RATES_WITH_CREDITS))
         .replace("__RATES_ONLY__", json.dumps(RATES_ONLY))
+        # panelSource lets the driver assert on call sites (e.g. that cacheRate
+        # is invoked with two arguments), which runtime probing alone cannot see.
+        .replace("__PANEL_SOURCE__", json.dumps(panel_js))
     )
     harness = "\n".join([STUBS, panel_js, driver])
 
