@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.9.1
+
+### Login failures are now visible (diagnosability)
+
+The Global login flow could complete in the browser while the panel spun on
+"请在浏览器完成登录" until the 5-minute TTL, then reported a generic expiry —
+with no way to tell apart three very different situations. Root-caused by
+driving the real code path against the live gateway (`go test -tags live`), and
+fixed by making every outcome report itself.
+
+**Verified live before/after** (real `www.workbuddy.ai`, 2026-09-15): a real
+Global login returns `{code:0, data:{accessToken, refreshToken, expiresIn,
+domain:"www.workbuddy.ai", scope, sessionState, tokenType}}`, `tokenData`
+decodes it correctly, `login/account` returns `200 code=0`, and the credential
+persists as `workbuddy-<uid>.json` with `accountRegion=global`. The token data
+path was already correct — what was broken was the *reporting* around it.
+
+- `logindiag.go` — new in-memory, **redaction-safe** step log per login flow.
+  Records status / business code / upstream msg / requestId per step, plus a
+  content-free rendering of the response shape (`jsonShape` reports key names,
+  nesting and string **lengths**, never values). Consecutive identical polls are
+  folded together (`×N`), so a minute of 2-second polls reads as one line
+  instead of burying the interesting entry. Bounded by a per-flow ring buffer
+  and a flow cap; pruned by the existing janitor. Never written to disk.
+- `oauth.go` — `doJSON` no longer flattens upstream detail into an opaque
+  string: failures now carry HTTP status, business code, msg and requestId
+  (`upstreamError`). `apiEnvelope` captures the previously-dropped `requestId`,
+  which is what upstream needs to trace a failed login.
+- `oauth.go` — **`pending` now means pending.** Poll outcomes are classified
+  instead of defaulting to `AuthLoginStatusPending`:
+  - only the recognised waiting code (`11217`) reports pending;
+  - any other business code, 4xx, redirect, parse failure, or missing
+    `accessToken` on a `code:0` response is a **terminal error** carrying the
+    upstream detail — these previously all looked like "still waiting";
+  - an *unrecognised* code is tolerated as pending for
+    `loginUnrecognisedCodeFastFail` (3) consecutive occurrences, so an unknown
+    pending variant cannot break a working login, then goes terminal — turning
+    a silent 5-minute hang into an immediate message.
+- `oauth.go` — a failed `login/account` lookup is no longer swallowed. It still
+  does not fail the login (the token is valid), but it is recorded, and the
+  panel warns when the credential would be saved under the bare
+  `workbuddy.json` name that `hostAuthList()` filters out — previously that
+  produced a **successful login with an account invisible to the panel**.
+- `oauth.go` — an omitted `expiresIn` is recorded as a warning. It previously
+  stamped `expiresAt = now`, silently creating a born-expired credential (the
+  same bug class already fixed on the refresh path via `preserveExpiry`).
+- `oauth.go` + `logindiag.go` — **a completed login is no longer lost when
+  persistence fails.** The upstream `auth/token` state is single-use and the
+  credential exists only in that response, so the successful poll now consumes
+  the state but caches the parsed credential (`loginResultStore`, 10-minute TTL,
+  bounded and janitor-pruned). A retried poll replays it instead of answering
+  "unknown state", and the host-driven path (which persists the credential
+  itself and never calls `handleLoginPoll`) still gets its credential. A failed
+  `host.auth.save` now returns `retryable: true` and the retry succeeds.
+- `credits_handler.go` — `/login/poll` responses carry diagnostics
+  (`diagnostics`, `upstream_code`, `upstream_http`, `request_id`), and a
+  `warning` when the saved file name would be invisible to the plugin.
+- `credits_handler.go` + `management.go` — new
+  `GET /login/diag[?state=]` returns the redacted step log for one flow (or the
+  list of flows), so a failure can be captured from a deployed instance without
+  re-running the login.
+- `panel.html` — **HTTP 429 is handled explicitly.** The panel polls every 2s
+  but the management limiter is 5 burst + 1 per 6s, so most polls were rejected;
+  a 429 body has no `status` field and previously fell through `pollLogin` into
+  the generic pending path — the throttle was displayed as "still waiting".
+  The panel now backs off for `Retry-After` (default 6s) and says so.
+- `panel.html` — the login dialog renders the redacted step log for pending,
+  error and success, so the user sees what is actually happening.
+- **Tests** — `login_observability_test.go` (pending whitelist, terminal
+  classification, fast-fail, `code:0`-without-token is an error, missing
+  `expiresIn` warning, visible `login/account` failure, save-failure
+  retryability, and a **no-token-material-leak** assertion over both the poll
+  response and the recorded diagnostics), `management_ratelimit_test.go`
+  (proves the 2s cadence cannot be sustained and that a 429 body carries no
+  `status` field), `login_poll_response_test.go`, and `live_probe_test.go`
+  (opt-in `-tags live` end-to-end probe against the real gateway).
+- **Test-seam fix** — existing stubs passed `[]byte` to `okEnvelope`, which
+  `json.Marshal` base64-encodes, so `HostAuthSaveResponse.Name` was silently
+  zero in every test that "checked" it. `login_poll_response_test.go` now uses
+  `json.RawMessage` and asserts the field for real.
+
 ## 0.9.0
 
 ### Native Global (international) login

@@ -1,5 +1,8 @@
 # Build artifacts
 *.so
+*.dll
+*.dylib
+*.exe
 *.h
 bin/
 dist/

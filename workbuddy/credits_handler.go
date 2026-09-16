@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
@@ -137,7 +138,23 @@ func handleLoginPoll(req pluginapi.ManagementRequest) map[string]any {
 		if strings.Contains(msg, "unknown state") || strings.Contains(msg, "expired") {
 			status = "expired"
 		}
-		return map[string]any{"status": status, "error": msg}
+		out := map[string]any{"status": status, "error": msg}
+		// Surface WHY: the upstream status/code/message and the redacted step
+		// log, so the panel can explain the failure instead of just saying
+		// "failed". Shape-only payloads keep this safe to display.
+		out["diagnostics"] = loginDiagEntries(state)
+		if last := lastDiagEntry(state); last != nil {
+			if last.Code != 0 {
+				out["upstream_code"] = last.Code
+			}
+			if last.HTTPStatus != 0 {
+				out["upstream_http"] = last.HTTPStatus
+			}
+			if last.RequestID != "" {
+				out["request_id"] = last.RequestID
+			}
+		}
+		return out
 	}
 	var env envelope
 	if err := json.Unmarshal(rawResp, &env); err != nil || !env.OK {
@@ -148,26 +165,38 @@ func handleLoginPoll(req pluginapi.ManagementRequest) map[string]any {
 		return map[string]any{"status": "error", "error": "poll: " + err.Error()}
 	}
 	if poll.Status != pluginapi.AuthLoginStatusSuccess {
-		return map[string]any{"status": string(poll.Status), "message": poll.Message}
+		return map[string]any{
+			"status":      string(poll.Status),
+			"message":     poll.Message,
+			"diagnostics": loginDiagSummary(state, 8),
+		}
 	}
 
 	sa, err := parseStored(poll.Auth.StorageJSON)
 	if err != nil {
-		return map[string]any{"status": "error", "error": "parse credential: " + err.Error()}
+		return map[string]any{"status": "error", "error": "parse credential: " + err.Error(),
+			"diagnostics": loginDiagEntries(state)}
 	}
 
 	// Persist exactly like credential import: nested storage + top-level
 	// type/note/logo/disabled, named workbuddy-<uid>.json.
 	fileJSON, err := buildAuthFileJSON(sa, false, displayNote(sa, nil, false), nil)
 	if err != nil {
-		return map[string]any{"status": "error", "error": err.Error()}
+		return map[string]any{"status": "error", "error": err.Error(),
+			"diagnostics": loginDiagEntries(state)}
 	}
 	auth := toAuthData(sa)
 	saveReq := pluginapi.HostAuthSaveRequest{Name: auth.FileName, JSON: fileJSON}
 	saveBody, _ := json.Marshal(saveReq)
 	rawSave, err := hostCall(pluginabi.MethodHostAuthSave, saveBody)
 	if err != nil {
-		return map[string]any{"status": "error", "error": "host.auth.save: " + err.Error()}
+		// The credential is still live in this response but the state has NOT
+		// been consumed, so the user can retry rather than restarting the whole
+		// browser login.
+		loginDiagAdd(state, loginDiagEntry{Step: "host.auth.save", Outcome: "failed",
+			Detail: truncateRedacted(err.Error(), 200)})
+		return map[string]any{"status": "error", "error": "host.auth.save: " + err.Error(),
+			"retryable": true, "diagnostics": loginDiagEntries(state)}
 	}
 	var saveEnv envelope
 	if err := json.Unmarshal(rawSave, &saveEnv); err != nil || !saveEnv.OK {
@@ -175,10 +204,17 @@ func handleLoginPoll(req pluginapi.ManagementRequest) map[string]any {
 		if saveEnv.Error != nil && saveEnv.Error.Message != "" {
 			msg = saveEnv.Error.Message
 		}
-		return map[string]any{"status": "error", "error": msg}
+		loginDiagAdd(state, loginDiagEntry{Step: "host.auth.save", Outcome: "failed", Detail: msg})
+		return map[string]any{"status": "error", "error": msg, "retryable": true,
+			"diagnostics": loginDiagEntries(state)}
 	}
 	var saveResp pluginapi.HostAuthSaveResponse
 	_ = json.Unmarshal(saveEnv.Result, &saveResp)
+
+	// Persisted: the cached credential copy is no longer needed for retries.
+	loginResultForget(state)
+	loginDiagAdd(state, loginDiagEntry{Step: "host.auth.save", Outcome: "ok",
+		Detail: fmt.Sprintf("saved as %q", saveResp.Name)})
 
 	// A Global login whose response omitted `domain` still lands on the right
 	// side of every downstream branch (see domainForRegion).
@@ -191,7 +227,7 @@ func handleLoginPoll(req pluginapi.ManagementRequest) map[string]any {
 			_ = deleteAuthFileInDir(filepath.Join(dir, authFileName), dir)
 		}
 	}
-	return map[string]any{
+	out := map[string]any{
 		"status":   "success",
 		"region":   region,
 		"uid":      sa.Account.UID,
@@ -199,6 +235,71 @@ func handleLoginPoll(req pluginapi.ManagementRequest) map[string]any {
 		"domain":   sa.Auth.Domain,
 		"name":     saveResp.Name,
 		"path":     saveResp.Path,
+	}
+	// Warn loudly when the credential was saved under a name the plugin's own
+	// listing cannot see (empty uid → bare workbuddy.json, filtered by
+	// hostAuthList). Without this the panel would report success while the
+	// account is invisible everywhere.
+	if strings.EqualFold(saveResp.Name, authFileName) || sa.Account.UID == "" {
+		out["warning"] = "凭证已保存为 " + authFileName + "（无 uid），插件列表不会显示该账号；请重新登录或检查 login/account 接口"
+	}
+	out["diagnostics"] = loginDiagSummary(state, 8)
+	// The record is deliberately NOT cleared here: on success the user may still
+	// want to see what happened (e.g. a login/account warning above), and on
+	// failure it is the whole point. Growth is bounded by the per-state ring
+	// buffer and the state cap in logindiag.go; the janitor prunes expired
+	// flows alongside their login state.
+	return out
+}
+
+// lastDiagEntry returns the most recent recorded step, or nil when the state has
+// no diagnostics (e.g. it was already cleared).
+func lastDiagEntry(state string) *loginDiagEntry {
+	entries := loginDiagEntries(state)
+	if len(entries) == 0 {
+		return nil
+	}
+	last := entries[len(entries)-1]
+	return &last
+}
+
+// handleLoginDiag returns the recorded steps of one login flow (or the list of
+// known flows when no state is given). Exists so a failure can be captured from
+// a deployed instance and pasted back for analysis without re-running the
+// login — the panel shows the same data, this makes it machine-readable.
+//
+// Query: ?state=<state>  (optional; omit to list known flows)
+// The payload is redaction-safe by construction: shapes, statuses, codes and
+// request ids only — never token material.
+func handleLoginDiag(req pluginapi.ManagementRequest) map[string]any {
+	state := ""
+	if v := req.Query["state"]; len(v) > 0 {
+		state = strings.TrimSpace(v[0])
+	}
+	if state == "" {
+		// List flows that still have a record. NOTE: never call
+		// loginDiagEntries while holding loginDiagMu — it takes the same
+		// non-reentrant mutex and deadlocks (caught by
+		// TestLoginDiagEndpoint). loginDiagStates copies the keys under the
+		// lock and releases it before we read each flow.
+		states := make([]map[string]any, 0)
+		for _, s := range loginDiagStates() {
+			entries := loginDiagEntries(s)
+			last := ""
+			if len(entries) > 0 {
+				last = entries[len(entries)-1].Outcome
+			}
+			states = append(states, map[string]any{
+				"state": s, "steps": len(entries), "last_outcome": last,
+			})
+		}
+		return map[string]any{"flows": states, "count": len(states)}
+	}
+	entries := loginDiagEntries(state)
+	return map[string]any{
+		"state":   state,
+		"steps":   entries,
+		"summary": loginDiagSummary(state, 0),
 	}
 }
 
