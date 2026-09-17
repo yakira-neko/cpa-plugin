@@ -239,7 +239,72 @@ jobs:
           echo "ARCHIVE_NAME=${PLUGIN}_${CLEAN_VERSION}_${GOOS_PART%-*}_${GOOS_PART#*-}.zip" >> "${GITHUB_ENV}"
           echo "LIB_NAME=${PLUGIN}.${{ matrix.ext }}" >> "${GITHUB_ENV}"
 
+      # FreeBSD is built here rather than by go-cross/cgo-actions: that action
+      # hardcodes download.freebsd.org/releases/<arch>/14.3-RELEASE/base.txz in
+      # dist/index.js, and FreeBSD removes superseded point releases from the
+      # CDN (14.3 was gone by 2026-09-16, leaving 14.4/14.5/15.0/15.1). Every
+      # go-cross ref has a dead version pinned (v1.0.1/v1.1.0 → 14.1, v1/main →
+      # 14.3), so no tag fixes it. We therefore fetch a sysroot that still
+      # exists and cross-compile with the runner's clang + lld.
+      - name: Build FreeBSD shared library
+        if: matrix.target == 'freebsd-amd64'
+        timeout-minutes: 45
+        working-directory: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+
+          # lld is required to link a FreeBSD target (GNU ld cannot), and the
+          # runner image ships clang but not lld.
+          if ! command -v ld.lld >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq clang lld
+          fi
+
+          # Resolve the newest 14.x release still published, so this does not
+          # rot the next time FreeBSD prunes a point release. 14.x is preferred
+          # to match the freebsd14 target the plugin declares; anything newer
+          # is only used if no 14.x remains. FB_RELEASE can pin it explicitly.
+          #
+          # Both pipelines end in `|| true` so an empty/renamed listing falls
+          # through to the explicit check below instead of aborting inside the
+          # substitution (where set -e would give no actionable message).
+          if [ -z "${FB_RELEASE:-}" ]; then
+            index=$(curl -fsSL https://download.freebsd.org/releases/amd64/)
+            FB_RELEASE=$(printf '%s' "$index" \
+              | grep -oE '[0-9]+\.[0-9]+-RELEASE' | sort -u -V \
+              | grep -E '^14\.' | tail -n1 || true)
+            if [ -z "$FB_RELEASE" ]; then
+              FB_RELEASE=$(printf '%s' "$index" \
+                | grep -oE '[0-9]+\.[0-9]+-RELEASE' | sort -u -V \
+                | tail -n1 || true)
+            fi
+          fi
+          if [ -z "$FB_RELEASE" ]; then
+            echo "::error::could not determine a FreeBSD release from the CDN listing; set FB_RELEASE to pin one"
+            exit 1
+          fi
+          echo "Using FreeBSD ${FB_RELEASE}"
+
+          curl -fsSL -o base.txz \
+            "https://download.freebsd.org/releases/amd64/${FB_RELEASE}/base.txz"
+          mkdir -p sysroot
+          sudo tar -xf base.txz -C sysroot
+          rm -f base.txz
+
+          # CC carrying flags is supported by Go (it splits on spaces), and is
+          # exactly what the go-cross action itself did. --target/--sysroot
+          # point clang at the downloaded FreeBSD headers and libraries.
+          FB_VER="${FB_RELEASE%-RELEASE}"
+          mkdir -p "dist/${{ matrix.target }}"
+          CGO_ENABLED=1 GOOS=freebsd GOARCH=amd64 \
+            CC="clang --target=x86_64-unknown-freebsd${FB_VER} --sysroot=$PWD/sysroot" \
+            CGO_LDFLAGS="-fuse-ld=lld" \
+            go build -trimpath -buildmode=c-shared \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "dist/${{ matrix.target }}/${LIB_NAME}" .
+
       - name: Build cross shared library
+        if: matrix.target != 'freebsd-amd64'
         timeout-minutes: 45
         uses: go-cross/cgo-actions@v1
         env:
