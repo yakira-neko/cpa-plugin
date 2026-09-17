@@ -157,6 +157,37 @@ in-panel flow.
 
 ## Unreleased
 
+- **Fix — CPAMP showed 总量 below 输入.** The live CN sample that pinned this
+  (glm-5.3, 2026-09) returned `prompt_tokens=150600` (of which
+  `cache_read=72400`), `completion_tokens=6300`, `total_tokens=84500` — i.e. the
+  upstream reports prompt as cache-**inclusive** but total as cache-**exclusive**
+  (`84500 = (150600-72400)+6300`). Forwarding both verbatim made CPAMP's
+  request-monitoring tooltip render 总量 84.5K *below* 输入 150.6K, which no
+  cost/token consumer can reconcile.
+  - `usage.go` — new `cacheInclusiveTotal`; the forwarded `total_tokens` is now
+    guaranteed coherent with the forwarded `input_tokens`. An upstream total is
+    kept when it already satisfies `total >= input`, so the pinned live
+    cache-hit fixture (`prompt=4443`/4043 cached, `completion=4`, `total=4447`)
+    still passes through untouched. `normalizeUsageDetail` delegates to it, so
+    the legacy `publishUsage` path is consistent too.
+  - `usage.go` — the forwarded `tokens` object now declares
+    `cache_input_mode: "included_in_input"`. CPAMP's `NormalizeCacheAccounting`
+    defaults an unclassified executor to `separate_from_input`, which would
+    re-add the cache buckets to an already-inclusive prompt and report 输入 as
+    223.0K instead of 150.6K. Declaring the convention pins it regardless of
+    model name. Older CPAMP builds ignore the key and keep showing the raw
+    150.6K, so the value is correct either way.
+  - Tests — `usage_forward_test.go` drives the real `forwardUsageToCPAMP` HTTP
+    path against a CPAMP-shaped `/v0/management/usage/import` endpoint and
+    asserts on the bytes that cross the wire: total never below input, upstream
+    coherent totals preserved (both live fixtures), and the omitted-total case
+    derived cache-inclusively. Needs a test seam,
+    `setUsageReportURLKey` (`usage_config.go`), because the forwarder reads its
+    destination from package state under lock with no injectable transport.
+  - Note — the plugin's *own* `creditEntry.Total` (`creditlog.go`) deliberately
+    sums every bucket (`in+out+cacheRead+cacheWrite`) and is not rendered in the
+    panel, so it is unchanged; the CPAMP wire contract is the one that must be
+    self-coherent.
 - Added request-level credit usage collection with JSONL persistence, retention limits, and model/hour/session aggregation APIs (/creditlog and /creditlog/summary).
 - Added panel-ready account credit package data and usage breakdown endpoints for per-request and session inspection.
 - Added prompt-cache token visibility: cache reads and cache writes are now parsed, stored and displayed as separate columns.

@@ -106,10 +106,7 @@ func forwardUsageToCPAMP(alias, model, authID string, started time.Time, detail 
 			latencyMs = 0
 		}
 	}
-	total := detail.TotalTokens
-	if total == 0 {
-		total = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
-	}
+	total := cacheInclusiveTotal(detail)
 	failBody := ""
 	failCode := 200
 	if failed {
@@ -140,6 +137,14 @@ func forwardUsageToCPAMP(alias, model, authID string, started time.Time, detail 
 			"cache_read_tokens":     detail.CacheReadTokens,
 			"cache_creation_tokens": detail.CacheCreationTokens,
 			"total_tokens":          total,
+			// CodeBuddy reports prompt_tokens cache-INCLUSIVE while its
+			// total_tokens is cache-EXCLUSIVE (live: prompt 150.6K incl. 72.4K
+			// cache reads, total 84.5K). Declaring the convention stops CPAMP
+			// from guessing: its NormalizeCacheAccounting defaults an
+			// unclassified executor to separate_from_input, which would re-add
+			// the cache buckets to an already-inclusive input and report 输入 as
+			// 223.0K instead of 150.6K.
+			"cache_input_mode": "included_in_input",
 		},
 		"fail": map[string]any{
 			"status_code": failCode,
@@ -166,11 +171,32 @@ func forwardUsageToCPAMP(alias, model, authID string, started time.Time, detail 
 	_ = resp.Body
 }
 
+// cacheInclusiveTotal returns the total token count to forward to CPAMP.
+//
+// WorkBuddy's upstream mixes two conventions in one usage block: prompt_tokens
+// is cache-INCLUSIVE (a cache read is still part of the prompt) while
+// total_tokens is cache-EXCLUSIVE. Live CN sample (glm-5.3, 2026-09):
+// prompt_tokens=150600 of which cache_read=72400, completion=6300,
+// total_tokens=84500 — i.e. exactly (150600-72400)+6300. Forwarding both
+// verbatim makes CPAMP's monitoring tooltip show 总量 (84.5K) BELOW 输入
+// (150.6K), which is unreconcilable for any cost/token consumer.
+//
+// An upstream total is kept only when it is coherent with the cache-inclusive
+// input (>= input), so the pinned live cache-hit fixture
+// (prompt=4443/4043 cached, completion=4, total=4447) passes through untouched.
+// Otherwise the total is derived cache-inclusively, which also avoids
+// double-counting cache reads the way input+output+cacheRead would.
+func cacheInclusiveTotal(d usage.Detail) int64 {
+	if d.TotalTokens > 0 && d.TotalTokens >= d.InputTokens {
+		return d.TotalTokens
+	}
+	return d.InputTokens + d.OutputTokens + d.ReasoningTokens
+}
+
+// normalizeUsageDetail returns d with TotalTokens filled in when absent.
 func normalizeUsageDetail(d usage.Detail) usage.Detail {
 	if d.TotalTokens == 0 {
-		if total := d.InputTokens + d.OutputTokens + d.ReasoningTokens; total > 0 {
-			d.TotalTokens = total
-		}
+		d.TotalTokens = cacheInclusiveTotal(d)
 	}
 	return d
 }

@@ -249,6 +249,21 @@ func resolveUsageReport(cfgURL, cfgKey string) {
 	usageReportMu.Unlock()
 }
 
+// setUsageReportURLKey overrides the CPAMP usage-import endpoint and returns a
+// restore func. Test-only: forwardUsageToCPAMP is a package-level sink with no
+// injectable transport, so the seam is the destination it reads under lock.
+func setUsageReportURLKey(url, key string) func() {
+	usageReportMu.Lock()
+	prevURL, prevKey := usageReportURL, usageReportKey
+	usageReportURL, usageReportKey = url, key
+	usageReportMu.Unlock()
+	return func() {
+		usageReportMu.Lock()
+		usageReportURL, usageReportKey = prevURL, prevKey
+		usageReportMu.Unlock()
+	}
+}
+
 // probeUsageReportURL tries localhost first (bare-metal + Docker host-network),
 // then Docker compose service name. Returns whichever responds; defaults to
 // localhost if both fail (better to try localhost than an unreachable hostname).
