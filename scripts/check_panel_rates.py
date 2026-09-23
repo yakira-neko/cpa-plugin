@@ -110,8 +110,19 @@ function defineGlobal(name, value) {
     /* leave the host's own global in place */
   }
 }
+// The panel's <script> opens with `const MANAGEMENT_BASE_PATH=__WB_MANAGEMENT_BASE_PATH_JSON__;`
+// — a placeholder the Go side substitutes at serve time (panel.go). Supply a
+// literal here so the extracted script parses as-is.
+defineGlobal("__WB_MANAGEMENT_BASE_PATH_JSON__", "/v0/management");
 defineGlobal("navigator", { userAgent: "node-check", language: "zh-CN" });
-defineGlobal("location", { host: "127.0.0.1:43120", pathname: "/panel", search: "" });
+// captureUrlKey() reads window.location.href to pick up a ?key= bootstrap
+// query, so href must be a parseable absolute URL (new URL() rejects undefined).
+defineGlobal("location", {
+  href: "http://127.0.0.1:43120/panel",
+  host: "127.0.0.1:43120",
+  pathname: "/panel",
+  search: "",
+});
 defineGlobal("history", { replaceState() {} });
 globalThis.CSS = { escape: (s) => String(s) };
 globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, addListener() {} });

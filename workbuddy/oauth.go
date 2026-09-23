@@ -11,21 +11,55 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-// newLoginClient builds an isolated client with its own cookie jar so that the
-// browser login for one state can never leak into another.
-func newLoginClient() *http.Client {
-	jar, _ := cookiejar.New(nil)
-	return &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: sharedHTTPClient().Transport,
-		Jar:       jar,
+type authRefreshRequestWire struct {
+	pluginapi.AuthRefreshRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+// newLoginClient builds an isolated client with its own cookie jar and binds it
+// to the routing snapshot active when the login starts.
+func newLoginClient() (*http.Client, error) {
+	state := currentProxyState()
+	if state.mode == proxyModeBlocked || state.mode == proxyModeExplicit && state.client == nil {
+		return nil, blockedProxyError()
 	}
+	transport := sharedHTTPClient().Transport
+	if state.mode == proxyModeExplicit {
+		transport = state.client.Transport
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{
+		Timeout:       30 * time.Second,
+		Transport:     transport,
+		Jar:           jar,
+		CheckRedirect: rejectHTTPRedirect,
+	}, nil
+}
+
+func loginClientForCurrentRouting(lc *loginCtx) (*http.Client, error) {
+	if lc == nil || lc.client == nil {
+		return nil, fmt.Errorf("login client unavailable")
+	}
+	routing := currentProxyState()
+	if routing.mode == proxyModeBlocked || routing.mode == proxyModeExplicit && routing.client == nil {
+		return nil, blockedProxyError()
+	}
+	client := *lc.client
+	client.CheckRedirect = rejectHTTPRedirect
+	if routing.mode == proxyModeExplicit {
+		client.Transport = routing.client.Transport
+	}
+	return &client, nil
 }
 
 // upstreamError carries the upstream envelope detail that the old code threw
@@ -78,6 +112,10 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 	} else {
 		commonHeaders(req)
 	}
+	return doJSONRequest(client, req)
+}
+
+func doJSONRequest(client *http.Client, req *http.Request) (json.RawMessage, int, error) {
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, &upstreamError{kind: "transport", Msg: truncateRedacted(err.Error(), 200)}
@@ -150,14 +188,159 @@ func regionFromStartRequest(raw []byte) Region {
 	return defaultLoginRegion()
 }
 
+// oauthRequestProfile selects the request identity for the OAuth handshake: the
+// platform query and the header set. It is deliberately orthogonal to Region —
+// Region picks the gateway host, the profile layers platform/headers on top of
+// it — so a Global login can use the desktop profile and vice versa.
+type oauthRequestProfile struct {
+	mode      string
+	platform  string
+	region    Region
+	userAgent string
+	origin    string
+}
+
+func oauthProfileForMode(mode string) oauthRequestProfile {
+	if mode == oauthClientModeWorkBuddy {
+		return oauthRequestProfile{
+			mode:      oauthClientModeWorkBuddy,
+			platform:  platformDesktop,
+			userAgent: "WorkBuddy/5.3.14 WorkBuddy/5.3.14 CLI/2.115.0",
+			origin:    "https://www.workbuddy.cn",
+		}
+	}
+	return oauthRequestProfile{
+		mode:      oauthClientModeCLI,
+		platform:  platformCLI,
+		userAgent: clientUA,
+		origin:    originReferer,
+	}
+}
+
+// profileRegion resolves the gateway a profile targets. A zero Region (a
+// profile built directly by a caller, or one written before region routing
+// existed) keeps the historical CN behaviour.
+func (p oauthRequestProfile) profileRegion() Region {
+	if p.region == "" {
+		return RegionCN
+	}
+	return p.region
+}
+
+func applyOAuthProfileHeaders(req *http.Request, profile oauthRequestProfile) {
+	// Start from the region's header set: both gateways validate Origin/Referer,
+	// so the base must follow the host. The desktop profile then overrides
+	// User-Agent and the Origin/Referer pair with the app's own values.
+	regionHeaders(req, profile.profileRegion())
+	if profile.mode != oauthClientModeWorkBuddy {
+		return
+	}
+	req.Header.Set("User-Agent", profile.userAgent)
+	req.Header.Set("Origin", profile.origin)
+	req.Header.Set("Referer", profile.origin+"/")
+}
+
+func applyAnonymousOAuthHeaders(req *http.Request, profile oauthRequestProfile) {
+	applyOAuthProfileHeaders(req, profile)
+	if profile.mode != oauthClientModeWorkBuddy {
+		return
+	}
+	req.Header.Set("X-No-Authorization", "true")
+	req.Header.Set("X-No-User-Id", "true")
+	req.Header.Set("X-No-Enterprise-Id", "true")
+	req.Header.Set("X-No-Department-Info", "true")
+}
+
+func buildAuthStateRequest(profile oauthRequestProfile) (*http.Request, error) {
+	req, err := http.NewRequest(http.MethodPost,
+		profile.profileRegion().authStateURLFor(profile.platform), bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return nil, err
+	}
+	applyAnonymousOAuthHeaders(req, profile)
+	return req, nil
+}
+
+func buildAuthTokenRequest(profile oauthRequestProfile, state string) (*http.Request, error) {
+	req, err := http.NewRequest(http.MethodGet, profile.profileRegion().authTokenURL(state), nil)
+	if err != nil {
+		return nil, err
+	}
+	applyAnonymousOAuthHeaders(req, profile)
+	return req, nil
+}
+
+func buildLoginAccountRequest(profile oauthRequestProfile, state, accessToken string) (*http.Request, error) {
+	req, err := http.NewRequest(http.MethodGet, profile.profileRegion().loginAcctURL(state), nil)
+	if err != nil {
+		return nil, err
+	}
+	applyOAuthProfileHeaders(req, profile)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	if profile.mode == oauthClientModeWorkBuddy {
+		req.Header.Set("X-No-User-Id", "true")
+		req.Header.Set("X-No-Enterprise-Id", "true")
+		req.Header.Set("X-No-Department-Info", "true")
+	}
+	return req, nil
+}
+
+func buildTokenRefreshRequest(profile oauthRequestProfile, sa *storedAuth) (*http.Request, error) {
+	req, err := http.NewRequest(http.MethodPost, endpointTokenRefreshFor(sa), nil)
+	if err != nil {
+		return nil, err
+	}
+	applyOAuthProfileHeaders(req, profile)
+	if profile.mode == oauthClientModeWorkBuddy {
+		req.Header.Set("X-No-Authorization", "true")
+		req.Header.Set("X-No-User-Id", "true")
+		req.Header.Set("X-No-Department-Info", "true")
+		if sa.Account.EnterpriseID == "" {
+			req.Header.Set("X-No-Enterprise-Id", "true")
+		}
+	}
+	req.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
+	if sa.Account.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
+	}
+	req.Header.Set("X-Auth-Refresh-Source", "plugin")
+	return req, nil
+}
+
+func decorateDesktopAuthURL(rawURL, loginSessionID string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	query := u.Query()
+	query.Set("version", "5.3.14")
+	query.Set("loginSessionId", loginSessionID)
+	u.RawQuery = query.Encode()
+	return u.String(), nil
+}
+
 // startLoginFlow issues a login state on the given region's gateway, registers
 // it for polling, and returns the browser-facing login URL. Shared by the host
 // AuthProvider RPC (handleStartLogin) and the panel-driven management route
 // (/login/start), which is how a user picks Global at runtime.
 func startLoginFlow(region Region) (pluginapi.AuthLoginStartResponse, error) {
-	client := newLoginClient()
-	headers := func(r *http.Request) { regionHeaders(r, region) }
-	data, _, err := doJSON(client, http.MethodPost, region.authStateURL(), headers, bytes.NewReader([]byte("{}")))
+	client, err := newLoginClient()
+	if err != nil {
+		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("%s auth state failed: %w", region, err)
+	}
+	// The OAuth client profile is a separate axis from the region: it selects
+	// the platform query and header set (cli vs WorkBuddy desktop app).
+	mode := oauthClientModeCLI
+	if features := currentFeatureRuntime(); features != nil {
+		mode = features.oauthClientMode
+	}
+	profile := oauthProfileForMode(mode)
+	profile.region = region
+	stateReq, err := buildAuthStateRequest(profile)
+	if err != nil {
+		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("%s auth state failed: %w", region, err)
+	}
+	data, _, err := doJSONRequest(client, stateReq)
 	if err != nil {
 		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("%s auth state failed: %w", region, err)
 	}
@@ -167,7 +350,23 @@ func startLoginFlow(region Region) (pluginapi.AuthLoginStartResponse, error) {
 		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("auth state: missing state or authUrl — please restart the login flow")
 	}
 	expires := time.Now().Add(loginTTL)
-	loginStates.Store(st.State, &loginCtx{client: client, region: region, expires: expires})
+	// The desktop profile correlates the browser flow with a session id stamped
+	// onto the auth URL; the CLI profile leaves the URL untouched.
+	loginSessionID := ""
+	if profile.mode == oauthClientModeWorkBuddy {
+		loginSessionID = randomHex(16)
+		st.AuthURL, err = decorateDesktopAuthURL(st.AuthURL, loginSessionID)
+		if err != nil {
+			return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("auth state: invalid authUrl: %w", err)
+		}
+	}
+	loginStates.Store(st.State, &loginCtx{
+		client:         client,
+		region:         region,
+		expires:        expires,
+		profile:        profile,
+		loginSessionID: loginSessionID,
+	})
 	return pluginapi.AuthLoginStartResponse{
 		Provider:  providerName,
 		URL:       st.AuthURL,
@@ -313,6 +512,19 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	if region == "" {
 		region = RegionCN // pre-Global loginCtx (or zero value) → historical default
 	}
+	// The request profile carries the platform/header identity for this flow.
+	// A loginCtx written before the profile existed falls back to the CLI
+	// profile, pinned to the region we are about to poll.
+	profile := lc.profile
+	if profile.mode == "" {
+		profile = oauthProfileForMode(oauthClientModeCLI)
+	}
+	profile.region = region
+	pollClient, err := loginClientForCurrentRouting(lc)
+	if err != nil {
+		loginStates.Delete(state)
+		return nil, fmt.Errorf("poll: %w", err)
+	}
 
 	// Single-shot poll per RPC: the host drives the polling cadence.
 	// auth/token is the authoritative login-status endpoint: the application
@@ -321,11 +533,17 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	// openresty gateway and is rejected (401) until login finishes, so probe
 	// token first and only fetch account once we hold a bearer.
 	//
-	// Headers must follow the region: doJSON's fallback is CN, and the
-	// workbuddy.ai gateway rejects a CN Origin.
-	tokHeaders := func(r *http.Request) { regionHeaders(r, region) }
-	tokRaw, status, errTok := doJSON(lc.client, http.MethodGet, region.authTokenURL(state), tokHeaders, nil)
-
+	// Headers must follow the region: workbuddy.ai rejects a CN Origin, and the
+	// profile layers the desktop platform identity on top when selected.
+	tokenReq, err := buildAuthTokenRequest(profile, state)
+	if err != nil {
+		loginStates.Delete(state)
+		return nil, fmt.Errorf("poll: token request: %w", err)
+	}
+	tokRaw, status, errTok := doJSONRequest(pollClient, tokenReq)
+	// classifyTokenPoll owns the verdict here: it already treats a transport
+	// failure or a 5xx as terminal, and reports the upstream detail instead of
+	// letting the caller poll until the TTL expires.
 	outcome, msg, ue := classifyTokenPoll(tokRaw, status, errTok)
 	entry := loginDiagEntry{Region: string(region), Step: "auth/token", HTTPStatus: status}
 	if ue != nil {
@@ -378,6 +596,11 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 			Message: msg,
 		})
 	}
+	pollClient, err = loginClientForCurrentRouting(lc)
+	if err != nil {
+		loginStates.Delete(state)
+		return nil, fmt.Errorf("poll: %w", err)
+	}
 
 	// outcomeSuccess — tokRaw holds a usable credential.
 	var tok tokenData
@@ -394,59 +617,62 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	loginDiagAdd(state, entry)
 
 	var acct accountData
-	acctHeaders := func(r *http.Request) {
-		regionHeaders(r, region)
-		r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	// The account lookup is REQUIRED, not best-effort. A missing uid degrades the
+	// saved name to the bare legacy "workbuddy.json", which hostAuthList()
+	// filters out — the credential would be written but stay invisible to the
+	// panel, with the user unable to reach or delete the account. Failing the
+	// login outright is the honest outcome: the user retries and gets a working,
+	// visible credential instead of a hidden one.
+	accountReq, err := buildLoginAccountRequest(profile, state, tok.AccessToken)
+	if err != nil {
+		loginStates.Delete(state)
+		return nil, fmt.Errorf("poll: account request: %w", err)
 	}
-	acctRaw, acctStatus, errAcct := doJSON(lc.client, http.MethodGet, region.loginAcctURL(state), acctHeaders, nil)
+	acctRaw, acctStatus, errAcct := doJSONRequest(pollClient, accountReq)
 	acctEntry := loginDiagEntry{Region: string(region), Step: "login/account", HTTPStatus: acctStatus}
 	if errAcct != nil {
-		var aue *upstreamError
 		if e, isUE := errAcct.(*upstreamError); isUE {
-			aue = e
 			acctEntry.Code = e.Code
 			acctEntry.Msg = e.Msg
 			acctEntry.RequestID = e.RequestID
 			acctEntry.Shape = e.Shape
 		}
-		// A failed account lookup is NOT fatal: the login itself succeeded and
-		// the token is valid. But it MUST be visible — a silent failure here
-		// yields an empty UID, which (via authFileNameFor) degrades the saved
-		// file name to the bare "workbuddy.json" that hostAuthList() filters
-		// out, making a real credential invisible to the panel.
 		acctEntry.Outcome = "failed"
-		acctEntry.Detail = "account lookup failed — credential will be saved without uid/nickname"
-		_ = aue
+		acctEntry.Detail = "account lookup failed after token success — login discarded"
 		loginDiagAdd(state, acctEntry)
-	} else {
-		_ = json.Unmarshal(acctRaw, &acct)
-		acctEntry.Outcome = "ok"
-		acctEntry.Detail = fmt.Sprintf("uid_present=%v nickname_present=%v", acct.UID != "", acct.Nickname != "")
-		loginDiagAdd(state, acctEntry)
+		loginStates.Delete(state)
+		return nil, fmt.Errorf("poll: account lookup failed after token success: %w", errAcct)
 	}
+	if err := json.Unmarshal(acctRaw, &acct); err != nil {
+		acctEntry.Outcome = "failed"
+		acctEntry.Detail = "account lookup response did not decode"
+		loginDiagAdd(state, acctEntry)
+		loginStates.Delete(state)
+		return nil, fmt.Errorf("poll: account lookup parse failed: %w", err)
+	}
+	acctEntry.Outcome = "ok"
+	acctEntry.Detail = fmt.Sprintf("uid_present=%v nickname_present=%v", acct.UID != "", acct.Nickname != "")
+	loginDiagAdd(state, acctEntry)
+
+	sa, err := buildLoginStoredAuth(tok, acct)
+	if err != nil {
+		loginStates.Delete(state)
+		return nil, fmt.Errorf("poll: %w", err)
+	}
+	// The stored domain drives every downstream region decision (billing base,
+	// chat base, Origin/Referer, check-in skip, trial eligibility, exhaust
+	// policy), so a Global login must never persist an empty or CN domain.
+	// Upstream normally returns the right value; this only fills in a missing
+	// one and never overrides a conflicting one.
+	sa.Auth.Domain = domainForRegion(sa.Auth.Domain, region)
 
 	// A missing expiresIn would stamp expiresAt=now (a credential that is born
 	// expired). preserveExpiry is used on the refresh path for the same reason;
 	// the login path must not silently produce a dead credential.
-	expiresAt := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	if tok.ExpiresIn <= 0 {
 		loginDiagAdd(state, loginDiagEntry{Region: string(region), Step: "login",
 			Outcome: "warn_no_expires_in",
 			Detail:  "upstream omitted expiresIn — credential would be stamped as already expired"})
-	}
-
-	sa := &storedAuth{
-		Auth: storedTokens{
-			AccessToken:  tok.AccessToken,
-			RefreshToken: tok.RefreshToken,
-			ExpiresAt:    expiresAt,
-			Domain:       domainForRegion(tok.Domain, region),
-		},
-		Account: storedAccount{
-			UID:          acct.UID,
-			EnterpriseID: acct.EnterpriseID,
-			Nickname:     acct.Nickname,
-		},
 	}
 	// The upstream state is single-use, so consume it now — but keep the parsed
 	// credential in a bounded cache keyed by the same state. The host-driven
@@ -458,7 +684,7 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	loginResultStore(state, sa)
 	return okEnvelope(pluginapi.AuthLoginPollResponse{
 		Status: pluginapi.AuthLoginStatusSuccess,
-		Auth:   toAuthData(sa),
+		Auth:   toAuthDataForLoginPoll(sa),
 	})
 }
 
@@ -479,8 +705,18 @@ func domainForRegion(upstreamDomain string, region Region) string {
 	return "www.codebuddy.cn"
 }
 
+// toAuthDataForLoginPoll returns the credential for a completed login poll with
+// an empty ID, so the host derives the account identity from the auth path
+// instead of a plugin-supplied (and historically wrong) UID. The refresh path
+// keeps its ID via toAuthDataForRefresh.
+func toAuthDataForLoginPoll(sa *storedAuth) pluginapi.AuthData {
+	ad := toAuthData(sa)
+	ad.ID = ""
+	return ad
+}
+
 func handleRefreshAuth(raw []byte) ([]byte, error) {
-	var req pluginapi.AuthRefreshRequest
+	var req authRefreshRequestWire
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
@@ -491,7 +727,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	// Route via host.http.do so request-log captures the refresh call (H2
 	// compliance: was doJSON(sharedHTTPClient()) — bypassed host transport
 	// policy + logging for the X-Refresh-Token endpoint).
-	data, raw2, status, err := refreshCall(sa)
+	data, raw2, status, err := refreshCallWithCallback(sa, req.HostCallbackID)
 	if err != nil {
 		if status >= 400 {
 			return nil, fmt.Errorf("refresh rejected (HTTP %d)", status)
@@ -510,15 +746,46 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if tok.Domain != "" {
 		sa.Auth.Domain = tok.Domain
 	}
-	sa.Auth.ExpiresAt = preserveExpiry(
-		time.Now().Add(time.Duration(tok.ExpiresIn)*time.Second).Unix(),
-		sa.Auth.ExpiresAt,
-	)
+	sa.Auth.ExpiresAt = expiryFromExpiresIn(tok.ExpiresIn, sa.Auth.ExpiresAt)
 	// No explicit host.auth.save here: the host's auth Manager persists the
 	// refreshed credential itself after Refresh returns (conductor.go
 	// refreshAuth → m.Update → persist). Writing from the plugin too would
 	// double-write the file.
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa)})
+	response, err := okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa)})
+	if err != nil {
+		return nil, err
+	}
+	currentModelRuntime().markAuthNotStarted(req.AuthID)
+	return response, nil
+}
+
+func buildLoginStoredAuth(tok tokenData, acct accountData) (*storedAuth, error) {
+	if strings.TrimSpace(tok.AccessToken) == "" {
+		return nil, fmt.Errorf("token response missing accessToken")
+	}
+	if strings.TrimSpace(acct.UID) == "" {
+		return nil, fmt.Errorf("account lookup missing uid")
+	}
+	return &storedAuth{
+		Auth: storedTokens{
+			AccessToken:  tok.AccessToken,
+			RefreshToken: tok.RefreshToken,
+			ExpiresAt:    expiryFromExpiresIn(tok.ExpiresIn, 0),
+			Domain:       tok.Domain,
+		},
+		Account: storedAccount{
+			UID:          acct.UID,
+			EnterpriseID: acct.EnterpriseID,
+			Nickname:     acct.Nickname,
+		},
+	}, nil
+}
+
+func expiryFromExpiresIn(expiresIn, oldExpiry int64) int64 {
+	if expiresIn <= 0 {
+		return oldExpiry
+	}
+	return time.Now().Add(time.Duration(expiresIn) * time.Second).Unix()
 }
 
 // preserveExpiry reuses the previous token's expiresAt when the refresh

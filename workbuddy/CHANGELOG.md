@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.10.0
+
+### Fork merge: dynamic model bootstrap + local hardening
+
+From upstream (Sliverkiss 0.9.0–0.9.3):
+
+- Dynamic model bootstrap: per-account catalog discovery, models.dev metadata
+  enrichment, persistent last-good caches, and fail-closed `ready`/`stale`
+  startup semantics, surfaced as a redacted `model_status` in the panel.
+- Optional `models` YAML configuration: a non-empty single-line string list is
+  the complete catalog.
+- Configurable prompt desensitization (opt-in U+200B obfuscator).
+- Plugin-level proxy routing (`proxy-url`).
+- Strict YAML config validation (no anchors, aliases, merge keys, duplicate
+  keys, or explicit tags), and panel BasePath / query-key handling.
+- Management auth hardening: the rate limiter charges failed authentication
+  only, and panel responses are classified without leaking response bodies.
+- Executor fixes: native stream errors, preserved host callback context,
+  typed upstream HTTP status, and bounded billing concurrency.
+
+From the local line (kept through the merge):
+
+- Credits ↔ tokens rate card (`GET /creditlog/rates`) with per-model factors now
+  loaded from `creditrates.json`, plus the per-request spend estimate.
+- Panel-driven CN/Global login with region routing, and login diagnostics
+  (`logindiag.go`) that report each step without leaking token material.
+- CPAMP usage forwarding with cache-inclusive `total_tokens` and an explicit
+  `cache_input_mode` declaration.
+
+### Merge decisions worth knowing
+
+- Account lookup is now REQUIRED. A login whose `login/account` call fails is
+  discarded rather than saved without a uid — a uid-less credential lands as
+  the bare `workbuddy.json` that the panel's account list filters out, so it
+  would be written but unreachable.
+- The panel no longer parses an upstream IP-ban wait window out of a 403 body.
+  That body is attacker-influenced text; the cooldown is a fixed local constant
+  and the response body is never read or reflected.
+
 ## 0.9.1
 
 ### Login failures are now visible (diagnosability)
@@ -270,6 +309,66 @@ in-panel flow.
     replacement, malformed-config tolerance, the handler's validation, and the
     exact JSON field names the panel reads (a rename would otherwise silently
     render "-" instead of failing).
+
+## 0.9.3
+
+### Dynamic model bootstrap
+
+- Accept the production CN JWT issuer host `www.codebuddy.cn` during per-auth model bootstrap.
+
+- Add optional `models` YAML configuration. A non-empty single-line string list is
+  the complete catalog and bypasses WorkBuddy catalog HTTP and cache access while
+  retaining models.dev metadata fetch, ETag, persistence, and last-good rules.
+- Discover each authenticated account's model entitlements from WorkBuddy, with a 404/405-only legacy endpoint fallback.
+- Enrich missing serving metadata from models.dev without a static model mapping or metadata table.
+- Persist separate global metadata and per-auth model last-good caches, and use them for fail-closed `ready` or executable `stale` startup semantics.
+- Expose redacted `model_status` readiness in the panel and gate executor and scheduler access to `ready` or `stale` accounts.
+
+### Management and panel maintenance
+
+- Stop valid management keys from consuming the failed-authentication rate-limit bucket.
+- Classify empty, non-JSON, malformed, and non-2xx panel responses without exposing response bodies or native errors.
+- Sort credits as positive, real zero, then unknown while preserving the original sort cycle and source order.
+- Exclude disabled and exhausted accounts from the panel's spendable remaining-credit total.
+- Keep partial-import failures visible by safe filename, clear credential inputs immediately, and close the modal only when every import succeeds.
+- Build panel requests from the host BasePath, store a query key in `sessionStorage`, and remove it from the URL.
+
+## 0.9.0
+
+### Configurable prompt desensitization
+
+- Add an opt-in U+200B desensitizer with an editable, persistent 85-term default list.
+- Restrict rewriting to system/developer prompt text, marked instruction blocks, and tool title/description fields.
+- Add panel controls to save custom terms, restore the built-in list, or reset the feature to disabled defaults.
+
+### OAuth, host bridge, and stream correctness
+
+- Use path-derived identity for OAuth poll results and add an explicit WorkBuddy desktop OAuth profile.
+- Preserve request-scoped host callback context and accept both `StatusCode` and `status_code` host responses.
+- Emit CPA-native stream errors and preserve typed upstream HTTP status for synchronous failures.
+
+### Credits and panel workflows
+
+- Bound concurrent billing fetches to four and add an opt-in, CN-only strict enterprise credits probe.
+- Prevent lifecycle actions from using stale credits after a refresh error and recognize `额度已用尽`.
+- Add sequential multi-file credential import, account search, and remaining-credit sorting to the panel.
+
+## 0.8.7
+
+### Client identity headers
+
+- Send the CodeBuddy-compatible `X-IDE-*` and `X-Agent-Intent` headers so upstream usage records identify CLI requests.
+- Generate independent 32-character hexadecimal request, conversation, conversation-request, and message IDs for every upstream request.
+
+## 0.8.6
+
+### Proxy routing, models, request policy, and panel diagnostics
+
+- Add plugin-level explicit proxy routing while preserving inherited CPA routing and fail-closed behavior.
+- Add `hy3-x`, `hy4-preview`, `hy4-preview-x`, and `glm-5.3-flash` to the fixed model list.
+- Pin canonical-model `reasoning_effort`: Hy3 and Hy4 preview models use `high`, `glm-5.3` uses `xhigh`, and `glm-5.3-flash` uses `max`.
+- Sanitize blocked outbound billing and `cc_*` fingerprint fields without changing ordinary prompt text.
+- Add the authenticated `/egress-ip` management endpoint and non-blocking current egress IP display in the panel.
 
 ## 0.8.2
 

@@ -294,6 +294,78 @@ func TestStartLoginFlow_CNURL(t *testing.T) {
 	_ = resp
 }
 
+// TestStartLoginFlow_RegionAndProfileAreIndependent pins the coupling the
+// region-routing and OAuth-profile features share: they are orthogonal axes,
+// and the merge that combined them must not let either one win.
+//
+// Region picks the GATEWAY HOST; the profile picks the PLATFORM query and the
+// header set. A desktop-profile login against Global must therefore talk to the
+// Global host while still carrying platform=workbuddy and the app's headers —
+// the two features were developed on separate branches, so each one's own tests
+// pass while this combination is broken. That is exactly the shape of bug a
+// merge introduces, so it gets its own test.
+func TestStartLoginFlow_RegionAndProfileAreIndependent(t *testing.T) {
+	oldFeatures := featureRuntime.Load()
+	desktop, err := parseFeatureRuntime([]byte("oauth_client_mode: workbuddy\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	featureRuntime.Store(desktop)
+	t.Cleanup(func() { featureRuntime.Store(oldFeatures) })
+
+	var gotPath, gotPlatform, gotUA, gotOrigin string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotPlatform = r.URL.Query().Get("platform")
+		gotUA = r.Header.Get("User-Agent")
+		gotOrigin = r.Header.Get("Origin")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"state":"st-global-desktop","authUrl":"https://www.workbuddy.ai/login?state=st-global-desktop"}}`))
+	}))
+	defer srv.Close()
+	defer setRegionBase(RegionGlobal, srv.URL)()
+
+	resp, err := startLoginFlow(RegionGlobal)
+	if err != nil {
+		t.Fatalf("startLoginFlow(global, desktop profile): %v", err)
+	}
+	if gotPath != "/v2/plugin/auth/state" {
+		t.Errorf("path = %q, want the auth-state endpoint", gotPath)
+	}
+	// The profile axis wins on the query and headers...
+	if gotPlatform != platformDesktop {
+		t.Errorf("platform = %q, want %q (the profile must survive region routing)", gotPlatform, platformDesktop)
+	}
+	if gotUA != "WorkBuddy/5.3.14 WorkBuddy/5.3.14 CLI/2.115.0" {
+		t.Errorf("User-Agent = %q, want the desktop profile's", gotUA)
+	}
+	if gotOrigin != "https://www.workbuddy.cn" {
+		t.Errorf("Origin = %q, want the desktop profile's", gotOrigin)
+	}
+	// ...and the region axis still decides whose gateway was contacted.
+	if !strings.Contains(srv.URL, "127.0.0.1") {
+		t.Fatalf("test server URL = %q, expected a local override", srv.URL)
+	}
+	v, ok := loginStates.Load("st-global-desktop")
+	if !ok {
+		t.Fatal("login state not registered")
+	}
+	lc := v.(*loginCtx)
+	if lc.region != RegionGlobal {
+		t.Errorf("loginCtx.region = %q, want global", lc.region)
+	}
+	if lc.profile.mode != oauthClientModeWorkBuddy {
+		t.Errorf("loginCtx.profile.mode = %q, want the desktop profile", lc.profile.mode)
+	}
+	if lc.loginSessionID == "" {
+		t.Error("desktop profile must stamp a loginSessionId onto the auth URL")
+	}
+	if !strings.Contains(resp.URL, "loginSessionId=") {
+		t.Errorf("browser URL = %q, want the desktop session decoration", resp.URL)
+	}
+	loginStates.Delete("st-global-desktop")
+}
+
 // TestStartLoginFlow_MissingStateIsError guards the "restart login" error path.
 func TestStartLoginFlow_MissingStateIsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -344,7 +416,7 @@ func TestPollLogin_FollowsLoginRegion(t *testing.T) {
 	defer setRegionBase(RegionGlobal, glSrv.URL)()
 
 	// Global login -> only the Global gateway is contacted.
-	loginStates.Store("g1", loginCtxIn(RegionGlobal))
+	loginStates.Store("g1", loginCtxIn(t, RegionGlobal))
 	body, err := handlePollLogin([]byte(`{"state":"g1"}`))
 	if err != nil {
 		t.Fatalf("poll global: %v", err)
@@ -371,7 +443,7 @@ func TestPollLogin_FollowsLoginRegion(t *testing.T) {
 	}
 
 	// CN login -> only the CN gateway is contacted.
-	loginStates.Store("c1", loginCtxIn(RegionCN))
+	loginStates.Store("c1", loginCtxIn(t, RegionCN))
 	cnHits, globalHits = 0, 0
 	body, err = handlePollLogin([]byte(`{"state":"c1"}`))
 	if err != nil {
@@ -410,7 +482,7 @@ func TestPollLogin_ZeroRegionFallsBackToCN(t *testing.T) {
 	defer setRegionBase(RegionCN, srv.URL)()
 
 	// Zero region: a loginCtx with no region set (pre-Global value).
-	loginStates.Store("z1", &loginCtx{client: newLoginClient(), expires: time.Now().Add(loginTTL)})
+	loginStates.Store("z1", &loginCtx{client: mustLoginClient(t), expires: time.Now().Add(loginTTL)})
 	body, err := handlePollLogin([]byte(`{"state":"z1"}`))
 	if err != nil {
 		t.Fatalf("poll: %v", err)
@@ -440,9 +512,21 @@ func tokDomain(state string) string {
 	return "www.codebuddy.cn"
 }
 
+// mustLoginClient builds a login client or fails the test. newLoginClient
+// returns an error so a blocked/explicit proxy config fails closed instead of
+// silently using the shared transport.
+func mustLoginClient(t *testing.T) *http.Client {
+	t.Helper()
+	client, err := newLoginClient()
+	if err != nil {
+		t.Fatalf("newLoginClient: %v", err)
+	}
+	return client
+}
+
 // loginCtxIn builds an unexpired loginCtx for the given region.
-func loginCtxIn(region Region) *loginCtx {
-	return &loginCtx{client: newLoginClient(), region: region, expires: time.Now().Add(loginTTL)}
+func loginCtxIn(t *testing.T, region Region) *loginCtx {
+	return &loginCtx{client: mustLoginClient(t), region: region, expires: time.Now().Add(loginTTL)}
 }
 
 func decodePoll(t *testing.T, body []byte) pluginapi.AuthLoginPollResponse {

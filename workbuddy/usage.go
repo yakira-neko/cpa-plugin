@@ -175,7 +175,7 @@ func forwardUsageToCPAMP(alias, model, authID string, started time.Time, detail 
 //
 // WorkBuddy's upstream mixes two conventions in one usage block: prompt_tokens
 // is cache-INCLUSIVE (a cache read is still part of the prompt) while
-// total_tokens is cache-EXCLUSIVE. Live CN sample (glm-5.3, 2026-09):
+// total_tokens is cache-EXCLUSIVE. Live CN sample (pinned 2026-09):
 // prompt_tokens=150600 of which cache_read=72400, completion=6300,
 // total_tokens=84500 — i.e. exactly (150600-72400)+6300. Forwarding both
 // verbatim makes CPAMP's monitoring tooltip show 总量 (84.5K) BELOW 输入

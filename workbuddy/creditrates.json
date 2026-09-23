@@ -1,0 +1,29 @@
+{
+  "_comment": "Built-in per-model cost factors for the credits<->tokens rate card. Factor 1.0 is the baseline: that model's output tokens cost the same as baseline input tokens. This lives in JSON rather than Go so the model catalog stays a runtime concern (the plugin discovers models dynamically) while pricing remains a static table an operator can read and override via the credit_rates config key.",
+  "_tiers": {
+    "expert": 1.5,
+    "baseline": 1.0,
+    "discounted": 0.8,
+    "lightweight": 0.5
+  },
+  "factors": {
+    "glm-5.3": 1.5,
+    "glm-5.2": 1.5,
+    "kimi-k3-1": 1.5,
+    "deepseek-v4-pro": 1.5,
+    "hy4-preview-x": 1.5,
+    "glm-5.1": 1.0,
+    "glm-5v-turbo": 1.0,
+    "minimax-m3": 1.0,
+    "hy4-preview": 1.0,
+    "hy3-x": 1.0,
+    "hy3": 1.0,
+    "kimi-k2.7": 0.8,
+    "kimi-k2.6": 0.8,
+    "hy3-preview": 0.8,
+    "hy3-preview-agent": 0.8,
+    "glm-5.3-flash": 0.5,
+    "deepseek-v4-flash": 0.5,
+    "deepseek-v4.1-flash": 0.5
+  }
+}

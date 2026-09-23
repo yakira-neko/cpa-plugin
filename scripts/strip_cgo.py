@@ -168,10 +168,20 @@ def main() -> int:
         if f.name == "main.go":
             continue
         shutil.copyfile(f, out_dir / f.name)
-    for name in ("go.mod", "go.sum", "panel.html", "baseprompt.json"):
-        p = plugin_dir / name
-        if p.is_file():
-            shutil.copyfile(p, out_dir / name)
+    # Copy every non-Go file too. These are package data the tests and embedded
+    # assets read at build/run time (panel.html is //go:embed'ed; VERSION is read
+    # by version_test.go; creditrates.json is //go:embed'ed). A fixed name list
+    # silently breaks the moment the package gains another data file, and the
+    # failure looks like an unrelated "pattern: no matching files found" from a
+    # perfectly good source tree — so copy by exclusion instead of enumeration.
+    # Skips build artifacts and editor/VCS noise rather than trying to list data
+    # files exhaustively.
+    skip_suffixes = (".so", ".h", ".exe", ".test", ".out")
+    skip_names = {"Makefile", "LICENSE"}
+    for p in plugin_dir.iterdir():
+        if not p.is_file() or p.suffix in skip_suffixes or p.name in skip_names:
+            continue
+        shutil.copyfile(p, out_dir / p.name)
 
     stripped = strip_main((plugin_dir / "main.go").read_text(encoding="utf-8"))
     (out_dir / "main.go").write_text(stripped, encoding="utf-8", newline="\n")

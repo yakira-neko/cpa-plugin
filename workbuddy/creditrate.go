@@ -29,6 +29,8 @@
 package main
 
 import (
+	_ "embed"
+	"encoding/json"
 	"math"
 	"sort"
 	"strconv"
@@ -59,35 +61,50 @@ const (
 	tokenClassCached tokenClass = "cached"
 )
 
-// staticCreditFactors is the built-in per-model cost factor. Factor 1.0 means
-// the model is the baseline: its output tokens cost the same as baseline input
-// tokens. Kept in sync with the model list in models.go.
-var staticCreditFactors = []struct {
+// creditRateEntry is one built-in per-model cost factor. Factor 1.0 means the
+// model is the baseline: its output tokens cost the same as baseline input
+// tokens.
+type creditRateEntry struct {
 	Model  string
 	Factor float64
-}{
-	// Expert tier — 1.5x
-	{"glm-5.3", 1.5},
-	{"glm-5.2", 1.5},
-	{"kimi-k3-1", 1.5},
-	{"deepseek-v4-pro", 1.5},
-	{"hy4-preview-x", 1.5},
-	// Baseline tier — 1.0x
-	{"glm-5.1", 1.0},
-	{"glm-5v-turbo", 1.0},
-	{"minimax-m3", 1.0},
-	{"hy4-preview", 1.0},
-	{"hy3-x", 1.0},
-	{"hy3", 1.0},
-	// Discounted tier — 0.8x
-	{"kimi-k2.7", 0.8},
-	{"kimi-k2.6", 0.8},
-	{"hy3-preview", 0.8},
-	{"hy3-preview-agent", 0.8},
-	// Lightweight tier — 0.5x
-	{"glm-5.3-flash", 0.5},
-	{"deepseek-v4-flash", 0.5},
-	{"deepseek-v4.1-flash", 0.5},
+}
+
+// creditRatesJSON is the built-in table, kept in a data file rather than as Go
+// literals. The plugin discovers its model catalog at runtime, so a hardcoded
+// model list in production code would be a second, drifting source of truth for
+// which models exist; pricing, however, is genuinely static and an operator
+// overrides it through the credit_rates config key. Keeping it in JSON lets the
+// model IDs live as data (readable, editable, diffable) without advertising a
+// static model contract.
+//
+//go:embed creditrates.json
+var creditRatesJSON []byte
+
+// staticCreditFactors is the parsed built-in table, ordered by descending
+// factor then model so the panel's rate list is stable across calls.
+// Populated once in init(); never mutated afterwards.
+var staticCreditFactors []creditRateEntry
+
+func init() {
+	var doc struct {
+		Factors map[string]float64 `json:"factors"`
+	}
+	if err := json.Unmarshal(creditRatesJSON, &doc); err != nil {
+		// A malformed embedded table is a build-time authoring error, not a
+		// runtime condition: fail loudly rather than silently pricing every
+		// model at the 1.0 baseline.
+		panic("creditrate: embedded creditrates.json is invalid: " + err.Error())
+	}
+	staticCreditFactors = make([]creditRateEntry, 0, len(doc.Factors))
+	for model, factor := range doc.Factors {
+		staticCreditFactors = append(staticCreditFactors, creditRateEntry{Model: model, Factor: factor})
+	}
+	sort.Slice(staticCreditFactors, func(i, j int) bool {
+		if staticCreditFactors[i].Factor != staticCreditFactors[j].Factor {
+			return staticCreditFactors[i].Factor > staticCreditFactors[j].Factor
+		}
+		return staticCreditFactors[i].Model < staticCreditFactors[j].Model
+	})
 }
 
 // creditRateSettings holds the tunable scalars of the rate card. Guarded by one
@@ -169,7 +186,7 @@ func resetCreditRates() {
 }
 
 // parseCreditRates decodes the `credit_rates` config value: comma-separated
-// "model=factor" pairs (e.g. "glm-5.3=1.5, kimi-k2.7=0.8"). Malformed entries
+// "model=factor" pairs (e.g. "some-model=1.5, other-model=0.8"). Malformed entries
 // are skipped rather than failing the whole configure pass — a typo in one
 // model must not silently discard the operator's other corrections.
 func parseCreditRates(raw string) map[string]float64 {

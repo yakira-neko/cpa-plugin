@@ -195,10 +195,17 @@ func TestExpiresInMissingIsWarned(t *testing.T) {
 	}
 }
 
-// TestAccountLookupFailureIsVisible pins that a failed login/account call no
-// longer disappears. It previously produced an empty UID, which degrades the
-// saved file name to the bare workbuddy.json that hostAuthList filters out —
-// making a real credential invisible to the panel with no signal at all.
+// TestAccountLookupFailureIsVisible pins that a failed login/account call is
+// reported instead of silently producing a hidden credential.
+//
+// A login whose account lookup fails still holds a valid token, but it has no
+// uid, and an empty uid degrades the saved file name to the bare
+// workbuddy.json that hostAuthList filters out — the credential would be
+// written yet remain invisible to the panel, with no way for the user to see
+// or delete it. Rather than persist an unreachable credential, the poll fails
+// outright so the user can retry and get a working, visible one. What must not
+// happen either way is silence: the failure is recorded in the login
+// diagnostics.
 func TestAccountLookupFailureIsVisible(t *testing.T) {
 	g := &loginTestGateway{
 		tokenBodies: []string{liveSuccessBody},
@@ -214,14 +221,15 @@ func TestAccountLookupFailureIsVisible(t *testing.T) {
 	state := startLoginForTest(t, srv)
 	out := pollForTest(state)
 
-	// The login itself succeeded — the token is valid.
-	if out["status"] != "success" {
-		t.Fatalf("status = %v, want success (%v)", out["status"], out)
+	// The poll must report a failure, not a success with a missing identity.
+	if got := fmtAny(out["status"]); got == "success" {
+		t.Fatalf("account lookup failed but poll reported success: %v", out)
 	}
-	// But the degraded identity must be explicit, and it must be recorded.
-	if got := fmtAny(out["warning"]); got == "" {
-		t.Errorf("no warning for a credential saved without a uid: %v", out)
+	if got := fmtAny(out["error"]); !strings.Contains(got, "account lookup failed") {
+		t.Errorf("error = %q, want it to name the failed account lookup", got)
 	}
+
+	// The failure must be visible in diagnostics, not swallowed.
 	recorded := false
 	for _, e := range loginDiagEntries(state) {
 		if e.Step == "login/account" && e.Outcome == "failed" {
@@ -231,8 +239,12 @@ func TestAccountLookupFailureIsVisible(t *testing.T) {
 	if !recorded {
 		t.Errorf("login/account failure was not recorded in diagnostics")
 	}
-	if !strings.EqualFold(savedName, authFileName) {
-		t.Errorf("saved name = %q; expected the bare legacy name to be the degraded case under test", savedName)
+
+	// And nothing may be persisted under the degraded legacy name: that file
+	// is filtered out of the panel's account list, so saving it would create a
+	// credential the user cannot reach.
+	if strings.EqualFold(savedName, authFileName) {
+		t.Errorf("saved a uid-less credential as %q; it would be invisible to the panel", savedName)
 	}
 }
 
